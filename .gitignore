@@ -1,0 +1,10 @@
+work/*
+shots/*
+# --- 运行状态与敏感文件（.state 里含 context_token / 会话凭据，不要提交）---
+.state/
+wechat_gateway.json
+wechat_inbox.jsonl
+wechat_media/
+__pycache__/
+*.pyc
+.DS_Store
