@@ -39,6 +39,14 @@ EXIT_NO_PANEL = 2
 EXIT_CHANNEL = 3
 EXIT_USAGE = 4
 
+# 探测过程中攒下的「这个端口为什么不算数」，供 status / doctor 打印（每次进程内有效）
+PROBE_NOTES: dict = {}
+
+
+def _print_notes(indent: str = "  ") -> None:
+    for port in sorted(PROBE_NOTES):
+        say("%s! %s" % (indent, PROBE_NOTES[port]))
+
 
 # --------------------------------------------------------------------------- 输出
 
@@ -137,6 +145,12 @@ def probe(entry: dict, timeout: float = DEFAULT_TIMEOUT):
     if not ok or status != 200 or not isinstance(data, dict) or not data.get("ok"):
         return None
     if data.get("app") != APP_TAG:
+        # 端口上确实有个活的 HTTP 服务，但它不是（或不是当前版本的）答题板。
+        # 最常见的成因：扩展代码更新过了，但编辑器没重载窗口，宿主还跑着旧版本。
+        PROBE_NOTES[int(port)] = (
+            "端口 %s 上的服务自称 %r，不是 %r —— 多半是扩展更新后没重载编辑器窗口"
+            % (port, data.get("app"), APP_TAG)
+        )
         return None
     merged = dict(entry)
     merged["port"] = int(data.get("port") or port)
@@ -151,6 +165,7 @@ def probe(entry: dict, timeout: float = DEFAULT_TIMEOUT):
 
 
 def live_instances(registry: str, timeout: float = DEFAULT_TIMEOUT) -> list:
+    PROBE_NOTES.clear()
     out = []
     seen = set()
     for entry in load_registry(registry):
@@ -287,10 +302,12 @@ def do_status(args) -> int:
         return EXIT_OK if instances else EXIT_NO_PANEL
     if not instances:
         say("NO-PANEL  注册文件 %s 里没有活着的面板" % registry)
+        _print_notes()
         return EXIT_NO_PANEL
     say("注册文件：%s" % registry)
     for inst in instances:
         say("  " + _fmt_instance(inst, verbose=True))
+    _print_notes()
     return EXIT_OK
 
 
@@ -307,10 +324,16 @@ def do_doctor(args) -> int:
     say("  存活面板      ：%d" % len(instances))
     for inst in instances:
         say("    - " + _fmt_instance(inst, verbose=True))
+    if PROBE_NOTES:
+        say("  探不通的原因  ：")
+        _print_notes("    ")
     if not raw:
         say("")
         say("  提示：注册文件不存在通常意味着扩展没激活。")
         say("        确认扩展已安装并重启过编辑器；或在命令面板运行「答题板: 显示服务信息」。")
+    elif not instances and PROBE_NOTES:
+        say("")
+        say("  提示：端口有服务但版本不认 → 在编辑器里执行一次 Reload Window 再试。")
     elif not instances:
         say("")
         say("  提示：有条目但探不通 → 编辑器可能已关闭（陈旧条目会被自动忽略）。")

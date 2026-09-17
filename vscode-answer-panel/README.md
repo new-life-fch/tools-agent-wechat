@@ -86,7 +86,7 @@ curl -X POST "http://127.0.0.1:$PORT/push" \
 ## 开发者
 
 ```bash
-node test/offline.test.js      # 30 项离线测试，不需要 VSCode
+node test/offline.test.js      # 31 项离线测试，不需要 VSCode
 ```
 
 测试覆盖 Store 语义、注册文件读写与死 pid 过滤、以及**真的用 Python CLI 打进真的 HTTP 服务**

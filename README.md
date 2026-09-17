@@ -187,7 +187,7 @@ cd vscode-answer-panel
 | `start_capture.py` | 截图端启动器：端口/对端/目录全部读 `wait_events.json` 的 `capture` 段，命令行可覆盖 |
 | `screenpeer.py` | 原截图工具（全局热键 `Ctrl+\``，事件在系统层被吃掉，前台程序收不到这个按键） |
 | `vscode_notify.py` | **推送到编辑器底框**：`push` `clear` `status` `doctor`，只用标准库、2 秒超时、永不阻塞（没面板就退出码 2） |
-| `vscode-answer-panel/` | **底框扩展源码**（纯 JS、零运行时依赖、约 18 KB vsix）+ `scripts/build.sh` / `scripts/install.sh` + 30 项离线测试 |
+| `vscode-answer-panel/` | **底框扩展源码**（纯 JS、零运行时依赖、约 18 KB vsix）+ `scripts/build.sh` / `scripts/install.sh` + 31 项离线测试 |
 | `selftest.py` | 离线自测（88 项：不重复打印/双源/重放/加密/切片/代码图/零事件阻塞/端口配置/独占登记/底框扩展） |
 | `SKILL.md` | **给 Agent 的编排流程与注意事项**（同一份也装在项目级技能目录 `<工作区>/.agents/skills/study-wechat-relay/`，DSH 自动加载；**不装用户级**） |
 

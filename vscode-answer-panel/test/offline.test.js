@@ -336,6 +336,27 @@ test('工作区匹配：cwd 命中 workspace 时选中该窗口', async () => {
   assert.strictEqual(JSON.parse(r.out).instances[0].port, started.port);
 });
 
+test('端口上是别的服务 → 明确提示「没重载窗口」，而不是无声无息', async () => {
+  // 真实事故：扩展代码更新了但宿主还跑旧版本，/health 的 app 标识对不上，
+  // 推送静默失败（退出码 2），用户完全不知道为什么。
+  const impostor = http.createServer((_rq, rs) => {
+    rs.writeHead(200, { 'Content-Type': 'application/json' });
+    rs.end(JSON.stringify({ ok: true, app: 'Visual Studio Code', pid: process.pid }));
+  });
+  const iport = await new Promise((res) => impostor.listen(0, '127.0.0.1', () => res(impostor.address().port)));
+  const fake = path.join(TMP, 'impostor.json');
+  registry.write(fake, [
+    { pid: process.pid, port: iport, token: 'x', app: 'X', workspace: PROJECT, updated_at: Date.now() }
+  ]);
+  const r = await runNotify(['--registry', fake, 'status']);
+  const d = await runNotify(['--registry', fake, 'doctor']);
+  await new Promise((res) => impostor.close(res));
+  assert.strictEqual(r.code, 2, r.out);
+  assert.ok(r.out.includes('没重载'), 'status 应提示重载窗口，实际：' + r.out);
+  assert.ok(r.out.includes('Visual Studio Code'), r.out);
+  assert.ok(d.out.includes('Reload Window'), 'doctor 应给出可执行动作，实际：' + d.out);
+});
+
 // ============================================================ 执行
 
 (async () => {
