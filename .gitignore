@@ -8,3 +8,8 @@ wechat_media/
 __pycache__/
 *.pyc
 .DS_Store
+
+# --- VSCode 底框扩展的构建产物 ---
+vscode-answer-panel/node_modules/
+vscode-answer-panel/.npm-cache/
+vscode-answer-panel/.tmp-test/

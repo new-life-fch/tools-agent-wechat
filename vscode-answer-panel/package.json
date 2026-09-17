@@ -1,0 +1,101 @@
+{
+  "name": "answer-panel",
+  "displayName": "答题板 Answer Panel",
+  "description": "接收本机命令推送的文本，在编辑器底部面板中自由滚动查看。",
+  "version": "0.1.0",
+  "publisher": "one-person-agent",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "views": {
+      "panel": [
+        {
+          "id": "answerPanel.main",
+          "name": "答题板",
+          "type": "webview",
+          "contextualTitle": "答题板"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "answerPanel.focus",
+        "title": "打开面板",
+        "category": "答题板"
+      },
+      {
+        "command": "answerPanel.clear",
+        "title": "清空",
+        "category": "答题板"
+      },
+      {
+        "command": "answerPanel.copyAll",
+        "title": "复制全部",
+        "category": "答题板"
+      },
+      {
+        "command": "answerPanel.showInfo",
+        "title": "显示服务信息",
+        "category": "答题板"
+      },
+      {
+        "command": "answerPanel.openInEditor",
+        "title": "在编辑器标签中打开（备用）",
+        "category": "答题板"
+      }
+    ],
+    "configuration": {
+      "title": "答题板",
+      "properties": {
+        "answerPanel.port": {
+          "type": "number",
+          "default": 5178,
+          "description": "本机 HTTP 服务起始端口（被占用时自动 +1 顺延，最多试 20 个）。"
+        },
+        "answerPanel.autoReveal": {
+          "type": "boolean",
+          "default": true,
+          "description": "收到推送时自动在底部展开面板。"
+        },
+        "answerPanel.requireToken": {
+          "type": "boolean",
+          "default": true,
+          "description": "要求请求携带令牌（令牌写在端口注册文件里，随用随取）。"
+        },
+        "answerPanel.bridgeFile": {
+          "type": "string",
+          "default": "",
+          "description": "端口注册文件路径。留空 = ~/.answer-panel/bridge.json。"
+        },
+        "answerPanel.maxItems": {
+          "type": "number",
+          "default": 200,
+          "description": "面板最多保留多少条消息，超出后丢弃最旧的。"
+        },
+        "answerPanel.persist": {
+          "type": "boolean",
+          "default": true,
+          "description": "窗口重载后保留面板内容。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node test/offline.test.js",
+    "package": "vsce package --no-dependencies --allow-missing-repository",
+    "build": "bash scripts/build.sh"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0"
+  }
+}

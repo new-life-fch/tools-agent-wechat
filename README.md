@@ -148,6 +148,32 @@ wechat_gateway.py ─读 wechat_gateway.json（独立）────────
 `screenpeer.py` 是工具本体（未被修改），只由 `start_capture.py` 拉起；
 也可以绕过启动器直接跑：`$P screenpeer.py 127.0.0.1 --port 5077 --save-dir shots`。
 
+## VSCode 底框（答题板，可选）
+
+除了发微信，Agent 还会把同一份答案**顺手铺到编辑器底部**——你在 Qoder / Cursor / Trae / VSCode 里
+刷题时不用掏手机，长文本可以自由上下滚动。
+
+```
+Agent ──► vscode_notify.py ──► HTTP 127.0.0.1:<port>/push ──► 扩展 ──► 底部面板「答题板」
+```
+
+装一次就够（扩展源码在 `vscode-answer-panel/`）：
+
+```bash
+cd vscode-answer-panel
+./scripts/build.sh          # 跑离线测试 + 打 .vsix
+./scripts/install.sh        # 自动侧载进本机所有 VSCode 系编辑器
+# 然后在编辑器里 Reload Window
+```
+
+- **它不是常驻进程**，不用你启动：编辑器激活扩展后自己监听，端口与令牌写在
+  `~/.answer-panel/bridge.json`，`vscode_notify.py` 自动去读。
+- **推不上不影响主流程**：编辑器没开 / 扩展没装时退出码 `2`，静默跳过，微信照发。
+- **只发文本**：保留缩进、空行与代码块边界，不做语法着色；算法题的代码图仍然只服务微信。
+- **适配分支编辑器**：只用稳定 API、零运行时依赖、`engines.vscode` 压到 `^1.85.0`，
+  因此 Qoder / Cursor / Trae / Windsurf / VSCodium 都能装。
+- 面板里可以上下滚动、跟随最新、单条复制、全部复制、清空；命令面板搜「答题板」也有同名命令。
+
 ## 文件清单
 
 | 文件 | 作用 |
@@ -160,7 +186,9 @@ wechat_gateway.py ─读 wechat_gateway.json（独立）────────
 | `code_image.py` | **代码转图片**：pygments 着色 + Pillow 绘制，中文注释不乱码，深/浅主题、行号、高亮、自适应宽度 |
 | `start_capture.py` | 截图端启动器：端口/对端/目录全部读 `wait_events.json` 的 `capture` 段，命令行可覆盖 |
 | `screenpeer.py` | 原截图工具（全局热键 `Ctrl+\``，事件在系统层被吃掉，前台程序收不到这个按键） |
-| `selftest.py` | 离线自测（41 项：不重复打印/双源/重放/加密/切片/代码图/零事件阻塞/端口配置） |
+| `vscode_notify.py` | **推送到编辑器底框**：`push` `clear` `status` `doctor`，只用标准库、2 秒超时、永不阻塞（没面板就退出码 2） |
+| `vscode-answer-panel/` | **底框扩展源码**（纯 JS、零运行时依赖、约 18 KB vsix）+ `scripts/build.sh` / `scripts/install.sh` + 30 项离线测试 |
+| `selftest.py` | 离线自测（88 项：不重复打印/双源/重放/加密/切片/代码图/零事件阻塞/端口配置/独占登记/底框扩展） |
 | `SKILL.md` | **给 Agent 的编排流程与注意事项**（同一份也装在项目级技能目录 `<工作区>/.agents/skills/study-wechat-relay/`，DSH 自动加载；**不装用户级**） |
 
 ## 关键行为（都是刻意的）
@@ -175,6 +203,7 @@ wechat_gateway.py ─读 wechat_gateway.json（独立）────────
 - **被中断也不丢事件**：干净退出才算「确认送达」；被 kill 掉的那一轮，下次运行以 `REPLAY` 补打。
 - **冷启动**：首次运行时目录里的历史截图静默忽略；微信历史消息回溯 5 分钟（可配），免得漏掉你刚发的问题。
 - **三级降级**：算法题发「代码图 → 源码文件 → 代码片段」，前一级失败才降级。
+- **底框是附送的**：答案先铺到编辑器底部（本地推送，2 秒超时），再发微信。编辑器没开就静默跳过，不重试、不阻塞、也不影响微信那条主通道。
 
 ## 常用命令
 
@@ -186,6 +215,8 @@ $P wechat_gateway.py chats                  # 已知会话（拿 chat_id 用 --t
 $P wait_events.py --once                    # 只扫一遍（调试）
 $P wait_events.py --status                  # 看账本
 $P code_image.py --in a.py --out a.png --lang python --title "T1"
+$P vscode_notify.py push -t "第3题" -f answer.md   # 顺手铺到编辑器底框
+$P vscode_notify.py status                 # 看有没有活着的底框（退出码 2 = 没有）
 $P selftest.py                              # 离线自测
 ```
 

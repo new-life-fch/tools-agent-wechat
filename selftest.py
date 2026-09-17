@@ -634,6 +634,104 @@ def test_code_image(root: str) -> None:
             check("图片尺寸合理", im.width > 400 and im.height > 100, "%dx%d" % (im.size))
 
 
+def test_vscode_panel(root: str) -> None:
+    print("\n[8] VSCode 底框（扩展 + 推送脚本）")
+    import re
+    ext = os.path.join(HERE, "vscode-answer-panel")
+    notify = os.path.join(HERE, "vscode_notify.py")
+
+    check("扩展目录结构完整",
+          all(os.path.exists(os.path.join(ext, rel)) for rel in (
+              "package.json", "extension.js", "lib/store.js", "lib/bridge.js",
+              "lib/registry.js", "lib/view.js", "lib/html.js", "test/offline.test.js")),
+          ext)
+
+    try:
+        with open(os.path.join(ext, "package.json"), encoding="utf-8") as f:
+            pkg = json.load(f)
+        views = pkg["contributes"]["views"]["panel"]
+        check("面板注册在内置 panel 容器（不是另开一个活动栏图标）",
+              any(v.get("id") == "answerPanel.main" for v in views), json.dumps(views, ensure_ascii=False))
+        eng = pkg["engines"]["vscode"]
+        m = re.match(r"^\^1\.(\d+)\.", eng)
+        check("engines.vscode 保持在低位（兼容 Cursor/Trae/Qoder 等分支）",
+              bool(m) and int(m.group(1)) <= 90, eng)
+        deps = pkg.get("dependencies") or {}
+        check("零运行时依赖（vsix 才小、也不踩分支的 Node 版本差异）", not deps, str(deps))
+    except Exception as exc:
+        check("package.json 解析", False, repr(exc))
+
+    try:
+        src = open(notify, encoding="utf-8").read()
+        check("vscode_notify.py 只用标准库", "urllib.request" in src and "import requests" not in src)
+        check("vscode_notify.py 有超时参数（永不阻塞）",
+              "timeout=args.timeout" in src and "DEFAULT_TIMEOUT" in src)
+    except Exception as exc:
+        check("vscode_notify.py 读取", False, repr(exc))
+
+    missing = os.path.join(root, "no_such_registry.json")
+    proc = subprocess.run([PY, notify, "--registry", missing, "status"],
+                          capture_output=True, text=True, timeout=30)
+    check("没有面板时 status 退出码=2（主流程据此静默跳过）", proc.returncode == 2,
+          "rc=%d %s" % (proc.returncode, (proc.stdout + proc.stderr).strip()[:90]))
+
+    proc = subprocess.run([PY, notify, "--registry", missing, "push", "--text", "hi"],
+                          capture_output=True, text=True, timeout=30)
+    check("没有面板时 push 快速返回 2 且打印 NO-PANEL",
+          proc.returncode == 2 and "NO-PANEL" in proc.stdout, proc.stdout.strip()[:90])
+
+    proc = subprocess.run([PY, notify, "push", "--help"], capture_output=True, text=True, timeout=30)
+    check("push --help 可用（全局参数放子命令前后都认）",
+          proc.returncode == 0 and "--registry" in proc.stdout, proc.stdout.strip()[:60])
+
+    node = shutil.which("node")
+    if not node:
+        check("node 未安装 → 跳过 JS 侧（不算失败）", True, "skip")
+        return
+    for rel in ("extension.js", "lib/store.js", "lib/bridge.js",
+                "lib/registry.js", "lib/view.js", "lib/html.js"):
+        proc = subprocess.run([node, "--check", os.path.join(ext, rel)],
+                              capture_output=True, text=True, timeout=30)
+        check("node --check %s" % rel, proc.returncode == 0, (proc.stderr or "").strip()[:90])
+
+    proc = subprocess.run([node, os.path.join(ext, "test", "offline.test.js")],
+                          capture_output=True, text=True, timeout=300, cwd=ext)
+    out = proc.stdout or ""
+    tail = out.strip().splitlines()[-1] if out.strip() else (proc.stderr or "").strip()[-90:]
+    check("离线端到端测试全绿（Store + 注册文件 + Python↔HTTP 契约）",
+          proc.returncode == 0 and "0 failed" in out, tail)
+
+
+def test_session_probe(root: str) -> None:
+    print("\n[13] 会话锁探针（锁文件只读时也必须能判断存活）")
+    import wait_events as we
+    lock = os.path.join(root, "probe.lock")
+    with open(lock, "w"):
+        pass
+    os.chmod(lock, 0o444)          # 只读：O_RDWR 打不开，只有 O_RDONLY 打得开
+    holder = subprocess.Popen(
+        [PY, "-c",
+         "import fcntl,sys,time\n"
+         "fh=open(sys.argv[1])\n"
+         "fcntl.flock(fh, fcntl.LOCK_EX)\n"
+         "time.sleep(8)\n", lock],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.0)
+        alive = we.session_ended(lock)
+        check("锁文件只读时探针仍能给出判断（不再退化成 None）", alive is not None,
+              "返回 None = 独占判定被废掉，被接管过的旧会话会把事件流抢回去")
+        check("有人持锁 → 判定为『会话还活着』(False)", alive is False, repr(alive))
+    finally:
+        holder.kill()
+        holder.wait()
+    time.sleep(0.4)
+    check("无人持锁 → 判定为『会话已结束』(True)", we.session_ended(lock) is True,
+          repr(we.session_ended(lock)))
+    check("锁文件不存在 → 判定为『已结束』(True)",
+          we.session_ended(os.path.join(root, "no_such.lock")) is True)
+
+
 # ----------------------------- 主流程 -----------------------------
 
 def main() -> int:
@@ -666,7 +764,8 @@ def main() -> int:
                test_exclusive_owner,
                test_archived_session,
                test_wechat_source,
-               test_ilink_offline, test_code_image):
+               test_ilink_offline, test_code_image, test_vscode_panel,
+               test_session_probe):
         try:
             fn(root)
         except Exception as exc:

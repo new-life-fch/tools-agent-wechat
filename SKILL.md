@@ -11,9 +11,12 @@ metadata: { "tags": "study, relay, wechat, screenshot, blocking-wait, exam" }
 
 ```
 用户按 Ctrl+` 截图 ──► shots/*.png ─┐
-                                    ├─► wait_events.py（阻塞）──► Agent 识图解题 ──► wechat_gateway.py ──► 微信
-用户在微信里发消息 ──► 收件箱 JSONL ─┘                                ▲                                    │
-                                                                      └────────── 再次阻塞等待 ◄────────────┘
+                                    ├─► wait_events.py（阻塞）──► Agent 识图解题
+用户在微信里发消息 ──► 收件箱 JSONL ─┘                                    │
+                                                                          ├─► wechat_gateway.py ──► 微信（主通道）
+                                                                          └─► vscode_notify.py  ──► 编辑器底部「答题板」（附送）
+                                                                          │
+                                                          再次阻塞等待 ◄───┘
 ```
 
 > 开跑之前先读一遍全文，特别是「铁律」和「异常处理手册」——这套流程的成败几乎全在纪律上。
@@ -42,6 +45,9 @@ $PY $OA/start_capture.py --print-cmd      # 看截图端会用哪个端口/目�
 ```
 
 起完这两个，你的活就是 §2 的五步循环；`wait_events.py` 是**阻塞**的，零事件时永远不退出。
+
+> 编辑器里的「答题板」底框**不是第三个常驻进程**——它由编辑器自己在启动时激活。你不用管它，
+> 只需要在步骤 4 顺手把答案推过去（推不上就算了，见 §1 铁律 9）。
 
 ### 配置在哪（只有用户让你改端口/目录时才需要看）
 
@@ -72,6 +78,8 @@ $PY $OA/start_capture.py --print-cmd      # 看截图端会用哪个端口/目�
 7. **不要自己在代码里做 LLM 路由**：双向消息由「你这个 Agent」处理，脚本只负责搬运。
 8. **图就是唯一信息源**：整图读一遍即可，**不要裁剪/放大局部反复看，也不要上网搜原题**——
    图里的题面/样例/语言/模式已经够了，搜来的题可能跟图不符，反而答错（除非用户明说「搜一下」）。
+9. **VSCode 底框是附送通道**：推送失败（编辑器没开/扩展没装）一律静默跳过，
+   **绝不允许**因此重试、阻塞、或提示用户去装扩展；微信才是必须发成功的那条。
 
 ## 2. SOP（每一轮都走这五步）
 
@@ -136,7 +144,33 @@ B=$OA/work/$(date +%Y%m%d_%H%M%S) && mkdir -p $B   # 记下这个绝对路径；
   - **全部样例通过**才继续；不过就改，改完再跑（最多绕 3 轮，仍不过就如实告诉用户卡在哪）。
 - **非算法题**：直接在脑子里核对选项/空；不确定的，把依据写清楚。
 
-### 步骤 4 — 发到微信
+### 步骤 4 — 发到微信（+ 顺手铺到 VSCode 底框）
+
+先铺 VSCode 底框（本地、2 秒超时、失败闭嘴），再发微信（主通道）。用户在编辑器里刷题时，
+底框能让他不掏手机就看到答案；微信照发不误。
+
+```bash
+# ① 铺到编辑器底部「答题板」——best-effort
+$PY $OA/vscode_notify.py push --title "第 3 题" --text "第 3 题（单选）｜答案：B
+简析：……"
+
+# ② 发微信（主通道）
+$PY $OA/wechat_gateway.py send --text "第 3 题（单选）｜答案：B
+简析：……"
+```
+
+- 正文长或带代码 → 先落盘再 `--file`，别在命令行里塞多行：
+
+  ```bash
+  # 算法题推底框的版本 = 思路 + 完整代码，围栏包住即可（底框只有文本，不需要代码图）
+  $PY $OA/vscode_notify.py push --title "T1 · 两数之和" --file $B/answer.md
+  ```
+
+- `--title` 写图里的**题号原文**；一题一条，多题按题号依次推。
+- 退出码：`0` 推到了 / `2` 编辑器没开或没装扩展 / `3` 连上了但被拒 —— 后两种**都是正常现象，
+  直接跳过继续解题**，不要重试、不要提醒用户装扩展。想看细节才用 `$PY $OA/vscode_notify.py doctor`。
+
+然后发微信：
 
 ```bash
 # 非算法题
@@ -236,6 +270,9 @@ $PY $OA/wechat_gateway.py send --text "…思路…
 | 网关挂了 | `$PY $OA/wechat_gateway.py serve` 重新拉起（后台跑）；收件箱是追加写，重启不会丢消息 |
 | 截图端端口被占 | `$PY $OA/start_capture.py --print-cmd` 会打印占用者 PID。默认自动避让并提示；要「就固定这个端口」把 `wait_events.json` 的 `capture.auto_port` 设 `false`（报错退出，绝不偷偷换）。局域网互传模式**永不自动换端口**（两端必须一致）|
 | 改了端口后收不到图 | 端口只影响截图端；轮询脚本只看目录。确认 `capture.save_dir`（或 `shot_dirs[0]`）与轮询的 `shot_dirs` 是同一个目录即可 |
+| `vscode_notify.py` 退出码 **2**（NO-PANEL） | **正常**：编辑器没开，或答题板扩展没装/没激活。跳过即可，**不要**提示用户去装、不要重试 |
+| `vscode_notify.py` 退出码 **3** | 连上了但被拒（多半是注册文件里的令牌过期）。同样跳过；用户问起才让他跑 `doctor` |
+| 用户说底框里没东西 | 先 `$PY $OA/vscode_notify.py status`：有面板说明通道正常，让用户点底部面板区的「答题板」标签（或命令面板「答题板: 打开面板」）；没面板就是编辑器没开 |
 
 ## 6. 省上下文的纪律（很重要）
 
@@ -271,6 +308,10 @@ $P wait_events.py                        # 阻塞等待（默认配置）
 $P wait_events.py --status               # 看账本
 $P wait_events.py --once                 # 只扫一遍（调试）
 $P code_image.py --in a.py --out a.png --lang python --title "T1"   # 代码转图片
+$P vscode_notify.py push -t "第3题" -f $B/answer.md   # 铺到编辑器底部「答题板」
+$P vscode_notify.py status                # 看有没有活着的面板（退出码 2 = 没有）
+$P vscode_notify.py doctor                # 面板连通性诊断
+$P vscode_notify.py clear                 # 清空面板
 $P selftest.py                           # 全量离线自测
 
 curl -s http://127.0.0.1:8799/health     # 网关状态
@@ -279,5 +320,7 @@ curl -s -X POST http://127.0.0.1:8799/send -H 'Content-Type: application/json' \
 ```
 
 配置文件：`wait_events.json`（间隔 2s / 空闲 10s / 监听源 / **截图端 `capture` 段：port、peer、cooldown、auto_port、save_dir**）、
-`wechat_gateway.json`（token、默认收件人、HTTP 端口）。Windows 上把路径换成对应形式即可，
-全部脚本都是跨平台的（无 shell 依赖、无 POSIX 专有调用）。
+`wechat_gateway.json`（token、默认收件人、HTTP 端口）。
+**VSCode 底框**（`vscode-answer-panel/`）不需要你启动：编辑器激活扩展后自己监听，端口和令牌写在
+`~/.answer-panel/bridge.json`，`vscode_notify.py` 自动去读；它不在跑也不影响主流程。
+Windows 上把路径换成对应形式即可，全部脚本都是跨平台的（无 shell 依赖、无 POSIX 专有调用）。
