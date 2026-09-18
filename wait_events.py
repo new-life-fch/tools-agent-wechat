@@ -334,7 +334,10 @@ def session_ended(lock_path: Optional[str]) -> Optional[bool]:
     if not os.path.exists(lock_path):
         return True
     try:
-        fd = os.open(lock_path, os.O_RDWR)
+        # 必须是 O_RDONLY：flock(2) 不要求写权限，而 O_RDWR 在「文件自身只读」或
+        # 「进程被文件沙箱限制写工作区外路径」时会直接 EPERM —— 探针于是永远返回 None，
+        # 等于把独占判定废掉：被接管过的旧会话能把事件流抢回去。
+        fd = os.open(lock_path, os.O_RDONLY)
     except OSError:
         return None
     try:
