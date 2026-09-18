@@ -43,7 +43,7 @@ python3 -m venv .venv
 .venv/bin/python wait_events.py                    # 阻塞等待（Agent 用）
 ```
 
-> 本工作区里用的是共享环境 `/Users/fch/project/dp-workspace/.venv/bin/python`，把上面的 `.venv/bin/python` 换成它即可。
+> 本工作区里用的是共享环境 `D:\Develop\Anaconda3\envs\python310\python.exe`，把上面的 `.venv/bin/python` 换成它即可。
 > 发给别人时建议让对方按上面步骤建**他自己的** `.venv`（别把 `.venv` 一起打包）。
 
 ### Windows
@@ -77,19 +77,20 @@ Windows 备注：
 **关键**：iLink 的机器人身份是**跟微信号绑定**的，别人必须扫出一张属于他自己的二维码。
 而 `wechat_gateway.json` 里存着 **token**——整包直接发出去，等于把自己的机器人身份一起送人了。
 
-```bash
+```powershell
+$P = "D:\Develop\Anaconda3\envs\python310\python.exe"; cd "D:\screenpeer-kit_self\one-person-agent"
+
 # A. 打包前：清掉你自己的凭据、收到的消息、媒体和状态
-python wechat_gateway.py logout --purge     # 清 token / 收件箱 / 媒体 / 上下文状态
-rm -rf shots/* work/* .state/               # 清截图与解题产物（Windows 手动删目录内容）
-rm -rf .venv __pycache__                    # 别打包虚拟环境
+& $P wechat_gateway.py logout --purge       # 清 token / 收件箱 / 媒体 / 上下文状态
+Remove-Item shots\*, work\*, .state\ -Recurse -Force   # 清截图与解题产物（Windows 手动删目录内容）
+Remove-Item .venv, __pycache__ -Recurse -Force         # 别打包虚拟环境
 
 # B. 打包（只带代码与配置模板）
-cd .. && zip -r screenpeer-kit.zip one-person-agent \
-    -x "*/__pycache__/*" "*/work/*" "*/.state/*" "*/.venv/*" "*/shots/*"
+cd ..; Compress-Archive -Path one-person-agent -DestinationPath screenpeer-kit.zip -Force
 
 # C. 对方拿到后：装依赖（见上），然后扫码——**务必加 --new**
-python wechat_gateway.py login --new        # → 生成全新二维码，扫出他自己的机器人
-python wechat_gateway.py doctor             # 确认 account_id 是他自己的
+& $P wechat_gateway.py login --new          # → 生成全新二维码，扫出他自己的机器人
+& $P wechat_gateway.py doctor               # 确认 account_id 是他自己的
 ```
 
 - `login`（不加参数）= **沿用**同目录里已有的机器人身份；`login --new` = **申请一张全新二维码**。
@@ -98,22 +99,22 @@ python wechat_gateway.py doctor             # 确认 account_id 是他自己的
 
 ## 整个链路的启动流程（三个常驻 + 一个主循环）
 
-```bash
-P=/Users/fch/project/dp-workspace/.venv/bin/python
-cd /Users/fch/project/dp-workspace/one-person-agent
+```powershell
+$P = "D:\Develop\Anaconda3\envs\python310\python.exe"
+cd "D:\screenpeer-kit_self\one-person-agent"
 
 # ① 一次性：微信扫码登录（只在首次 / 换号时做；需你本人用手机扫）
-$P wechat_gateway.py login
+& $P wechat_gateway.py login
 
 # ② 常驻 A：微信网关 —— 长轮询收微信消息 + 本地 HTTP API（127.0.0.1:8799）
-$P wechat_gateway.py serve
+& $P wechat_gateway.py serve
 
 # ③ 常驻 B：截图端 —— 按 Ctrl+` 截图落进 shots/（端口/目录读 wait_events.json 的 capture 段）
-$P start_capture.py --print-cmd     # 先确认端口/目录，不启动
-$P start_capture.py
+& $P start_capture.py --print-cmd     # 先确认端口/目录，不启动
+& $P start_capture.py
 
 # ④ 主循环（Agent 侧）：阻塞等待 → 读图解题 → 发微信 → 再回到 ④
-$P wait_events.py
+& $P wait_events.py
 ```
 
 **顺序无所谓**（三个进程互不依赖），但要「先全起来，再让用户按热键」。
@@ -121,9 +122,9 @@ $P wait_events.py
 
 | 步骤 | 验证 |
 |---|---|
-| ① | `$P wechat_gateway.py doctor` → 凭据 ✓ / iLink 可达 ✓ |
-| ② | `curl -s http://127.0.0.1:8799/health` → `"ok": true`，收到消息时 `inbox.count` 增长 |
-| ③ | 日志出现「接收保存目录 …」「[热键] Ctrl+` 已启用」；`lsof -nP -iTCP:5077 -sTCP:LISTEN` 有输出 |
+| ① | `& $P wechat_gateway.py doctor` → 凭据 ✓ / iLink 可达 ✓ |
+| ② | `Invoke-RestMethod http://127.0.0.1:8799/health` → `"ok": true`，收到消息时 `inbox.count` 增长 |
+| ③ | 日志出现「接收保存目录 …」「[热键] Ctrl+` 已启用」；`Get-NetTCPConnection -LocalPort 9119 -State Listen` 有输出 |
 | ④ | 打印横幅后安静等待即是正常（**零事件不退出**，静默 ≠ 卡死）|
 
 ### 谁读哪份配置 / 谁拉起谁
@@ -132,10 +133,10 @@ $P wait_events.py
 start_capture.py ──读 wait_events.json 的 capture 段──► subprocess.Popen([
                                                           python, screenpeer.py,
                                                           self→127.0.0.1,
-                                                          --port 5077,
+                                                          --port 9119,
                                                           --save-dir shots,
-                                                          --cooldown 2.0 ])
-wait_events.py   ──读 wait_events.json 全部────────────────► 盯 shots/ + wechat_inbox.jsonl
+                                                          --cooldown 1.5 ])
+wait_events.py   ──读 wait_events.json 全部────────────────► 盯 shots\ + wechat_inbox.jsonl
 wechat_gateway.py ─读 wechat_gateway.json（独立）─────────► iLink Bot API + HTTP :8799
 ```
 
@@ -146,7 +147,7 @@ wechat_gateway.py ─读 wechat_gateway.json（独立）────────
 
 即：**截图这一侧只配 `wait_events.json`，微信那一侧只配 `wechat_gateway.json`**。
 `screenpeer.py` 是工具本体（未被修改），只由 `start_capture.py` 拉起；
-也可以绕过启动器直接跑：`$P screenpeer.py 127.0.0.1 --port 5077 --save-dir shots`。
+也可以绕过启动器直接跑：`& $P screenpeer.py 127.0.0.1 --port 9119 --save-dir shots`。
 
 ## 文件清单
 
@@ -178,24 +179,26 @@ wechat_gateway.py ─读 wechat_gateway.json（独立）────────
 
 ## 常用命令
 
-```bash
-$P wechat_gateway.py send --text "第 3 题（单选）｜答案：B"       # 发文本
-$P wechat_gateway.py send --text "思路…" --image code.png --file solution.py
-$P wechat_gateway.py inbox --since 0        # 看收到的消息
-$P wechat_gateway.py chats                  # 已知会话（拿 chat_id 用 --to 指定）
-$P wait_events.py --once                    # 只扫一遍（调试）
-$P wait_events.py --status                  # 看账本
-$P code_image.py --in a.py --out a.png --lang python --title "T1"
-$P selftest.py                              # 离线自测
+```powershell
+$P = "D:\Develop\Anaconda3\envs\python310\python.exe"; cd "D:\screenpeer-kit_self\one-person-agent"
+
+& $P wechat_gateway.py send --text "第 3 题（单选）｜答案：B"       # 发文本
+& $P wechat_gateway.py send --text "思路…" --image code.png --file solution.py
+& $P wechat_gateway.py inbox --since 0        # 看收到的消息
+& $P wechat_gateway.py chats                  # 已知会话（拿 chat_id 用 --to 指定）
+& $P wait_events.py --once                    # 只扫一遍（调试）
+& $P wait_events.py --status                  # 看账本
+& $P code_image.py --in a.py --out a.png --lang python --title "T1"
+& $P selftest.py                              # 离线自测
 ```
 
 HTTP API（`serve` 模式，默认只听 `127.0.0.1:8799`）：
 
-```bash
-curl -s http://127.0.0.1:8799/health
-curl -s http://127.0.0.1:8799/inbox?since=0
-curl -s -X POST http://127.0.0.1:8799/send -H 'Content-Type: application/json' \
-     -d '{"text":"hello","images":["/abs/code.png"]}'
+```powershell
+Invoke-RestMethod http://127.0.0.1:8799/health
+Invoke-RestMethod http://127.0.0.1:8799/inbox?since=0
+Invoke-RestMethod -Method Post http://127.0.0.1:8799/send -ContentType "application/json" `
+     -Body '{"text":"hello","images":["D:\\screenpeer-kit_self\\one-person-agent\\work\\code.png"]}'
 ```
 
 ## 常见问题
@@ -203,10 +206,10 @@ curl -s -X POST http://127.0.0.1:8799/send -H 'Content-Type: application/json' \
 | 现象 | 原因 / 处理 |
 |---|---|
 | `send` 报 `prepare failed` / `ret=-2` | 与收件人的会话还没建立：**让接收方先在微信里给机器人发一条消息**，之后就能主动推 |
-| 端口 5077 被占用 | 本机已有另一个 screenpeer 实例（`--print-cmd` 会打印占用者 PID）。默认自动避让并提示；要固定端口就把 `wait_events.json` 的 `capture.auto_port` 设 `false`（直接报错，不偷偷换）。局域网互传模式永不自动换端口 |
+| 端口 9119 被占用 | 本机已有另一个 screenpeer 实例（`--print-cmd` 会打印占用者 PID）。默认自动避让并提示；要固定端口就把 `wait_events.json` 的 `capture.auto_port` 设 `false`（直接报错，不偷偷换）。局域网互传模式永不自动换端口 |
 | 热键按了没反应 | macOS 需给运行终端授权「屏幕录制 + 辅助功能」，授权后重启终端；Windows 无需授权 |
 | 收不到微信消息 | iLink 的 bot 是**独立身份**（`xxx@im.bot`），普通微信群基本收不到事件、也进不了群；**私聊可靠** |
-| token 失效 | `$P wechat_gateway.py login --force` 重新扫码（必须你本人扫）|
+| token 失效 | `& $P wechat_gateway.py login --force` 重新扫码（必须你本人扫）|
 | 图片在微信里是灰块 | `aes_key` 必须是 base64(hex 字符串)，见 `ilink_client.py` 的注释，别改坏 |
 
 ## Windows 适配

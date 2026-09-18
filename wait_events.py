@@ -73,7 +73,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "globs": ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"],
     "poll_interval_sec": 2.0,
     "idle_timeout_sec": 10.0,
-    "max_wait_sec": 0,
+    # 零事件阻塞时的硬上限。**默认给 300 而不是 0**：0 会让脚本永不退出、永不产生
+    # 「任务结束」通知，Agent 一侧只要漏掉一次唤醒就是无限期静默。300 = 最坏每 5 分钟
+    # 必然退出一次并唤醒 Agent。这是机制兜底，应该由代码/配置模板保证，不靠 Agent 自觉。
+    "max_wait_sec": 300,
     "stability_check": True,
     "ignore_suffixes": [".part", ".tmp", ".crdownload", ".download", ".partial", ".!ut"],
     "ignore_prefixes": [".", "~$", "._"],
@@ -249,10 +252,41 @@ class State:
 #   * 新会话启动即接管；被接管的旧脚本在下一轮**静默退出**（不打印事件、不改账本）；
 #   * 只要接管者还在任，被接管者就不能再抢回来（避免两个会话来回抢）。
 
+def pid_alive_win32(pid: int) -> Optional[bool]:
+    """Windows：用纯 Win32 API 判断进程是否存活（不启子进程、不建管道）。判断不了返回 None。
+
+    为什么不用 `tasklist`：某些受限运行环境（如 DSH 沙箱）禁止捕获子进程输出，
+    `tasklist` 会直接抛错，旧的兜底「查不到就当活着」于是把**已经退出的 pid** 误判成活着，
+    独占登记就永远解不开（连 `--force-owner` 也绕不过同会话那条分支）。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            # 5 = ERROR_ACCESS_DENIED（进程存在但没权限打开，算活着）；87 = 不存在
+            return ctypes.get_last_error() == 5
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return None
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if sys.platform.startswith("win"):
+        alive = pid_alive_win32(pid)
+        if alive is not None:
+            return alive
         try:
             out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
                                  capture_output=True, text=True, timeout=5, errors="replace").stdout
@@ -334,10 +368,7 @@ def session_ended(lock_path: Optional[str]) -> Optional[bool]:
     if not os.path.exists(lock_path):
         return True
     try:
-        # 必须是 O_RDONLY：flock(2) 不要求写权限，而 O_RDWR 在「文件自身只读」或
-        # 「进程被文件沙箱限制写工作区外路径」时会直接 EPERM —— 探针于是永远返回 None，
-        # 等于把独占判定废掉：被接管过的旧会话能把事件流抢回去。
-        fd = os.open(lock_path, os.O_RDONLY)
+        fd = os.open(lock_path, os.O_RDWR)
     except OSError:
         return None
     try:
@@ -705,7 +736,16 @@ class WechatSource:
     def poll(self) -> List[Tuple[Dict[str, Any], bool]]:
         """返回 [(记录, 是否重放)]；同时把 read_offset 推进到已打印的位置（内存）"""
         if not self.available:
-            return []
+            # 收件箱是 serve 收到第一条消息时才创建的，而等待脚本通常先启动，
+            # 所以这里必须重新检查一次；否则整个 run 都会看不到微信消息。
+            if not os.path.exists(self.inbox):
+                return []
+            if self.require_fresh:
+                age = self.heartbeat_age()
+                if age is not None and age > 90:
+                    return []
+            self.available = True
+            self.warning = ""
         try:
             size = os.path.getsize(self.inbox)
         except OSError:

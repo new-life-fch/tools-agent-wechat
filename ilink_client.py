@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import http.client
 import json
 import os
 import random
@@ -293,24 +292,6 @@ def split_text(content: str, max_length: int = MAX_MESSAGE_LENGTH) -> List[str]:
 
 # ----------------------------- 客户端 -----------------------------
 
-def _is_absolute_url(value: str) -> bool:
-    return str(value).startswith("http://") or str(value).startswith("https://")
-
-
-def _same_origin(a: str, b: str) -> bool:
-    """同源判定（scheme + host + 端口）。只比主机名不够：同一台机器上的不同端口是不同服务。"""
-    try:
-        pa, pb = urllib.parse.urlparse(a), urllib.parse.urlparse(b)
-    except ValueError:
-        return False
-
-    def norm(p):
-        port = p.port or (443 if p.scheme == "https" else 80)
-        return (p.scheme, (p.hostname or "").lower(), port)
-
-    return norm(pa) == norm(pb)
-
-
 class IlinkClient:
     """iLink Bot API 同步客户端。所有方法失败抛 IlinkError。"""
 
@@ -362,20 +343,10 @@ class IlinkClient:
         base_url: Optional[str] = None,
         raw_response: bool = False,
     ) -> Any:
-        # endpoint 允许是**绝对 URL**（CDN 下载就走这条路）。以前这里无条件拼 base_url，
-        # 于是下载变成了 https://ilinkai.weixin.qq.com/https://novac2c.cdn…/c2c/download?…，
-        # CDN 一律回 404 —— 而报错里打印的是入参，看起来完全正常，坑了很久。
-        origin = base_url or self.base_url
-        absolute = _is_absolute_url(endpoint)
-        url = endpoint if absolute else "%s/%s" % (origin.rstrip("/"), endpoint)
+        url = "%s/%s" % ((base_url or self.base_url).rstrip("/"), endpoint)
         headers = self._headers(body or "")
         if raw_response:
             headers.pop("Content-Type", None)
-        if absolute and not _same_origin(url, origin):
-            # 打到第三方（CDN）时不要外发 bot 凭据；CDN 本来也不认这些头
-            for name in ("Authorization", "AuthorizationType", "X-WECHAT-UIN",
-                         "iLink-App-Id", "iLink-App-ClientVersion"):
-                headers.pop(name, None)
         data = body.encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
         try:
@@ -390,16 +361,11 @@ class IlinkClient:
                 detail = exc.read()[:200].decode("utf-8", "replace")
             except Exception:
                 pass
-            # 报错必须给真正请求的 url，不是入参
-            raise IlinkError("HTTP %s %s -> %s %s" % (method, url, exc.code, detail)) from exc
+            raise IlinkError("HTTP %s %s -> %s %s" % (method, endpoint, exc.code, detail)) from exc
         except urllib.error.URLError as exc:
-            raise IlinkError("网络错误 %s %s -> %s" % (method, url, exc.reason)) from exc
+            raise IlinkError("网络错误 %s %s -> %s" % (method, endpoint, exc.reason)) from exc
         except json.JSONDecodeError as exc:
             raise IlinkError("响应不是合法 JSON: %s" % exc) from exc
-        except (http.client.HTTPException, ConnectionError, OSError) as exc:
-            # 长轮询常见：服务端/NAT/代理把闲置连接直接关掉（RemoteDisconnected、BadStatusLine…）。
-            # 注意 RemoteDisconnected 不是 URLError，必须在这里兜住，否则会当成「未知异常」刷屏。
-            raise IlinkError("连接中断 %s %s -> %s" % (method, url, exc.__class__.__name__)) from exc
 
     def _post(self, endpoint: str, payload: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
         body = json.dumps(
@@ -480,11 +446,8 @@ class IlinkClient:
         try:
             resp = self._post(EP_GET_UPDATES, {"get_updates_buf": sync_buf}, timeout=timeout_ms / 1000.0 + 5)
         except IlinkError as exc:
-            text = str(exc).lower()
-            if "timed out" in text or "连接中断" in str(exc):
-                # 两种情况都等于「本轮没有新消息」：游标没动，下轮用同一个 buf 再问即可，一条都不会丢。
-                # 带 reconnect 标记只是为了让上层把它记成「正常重连」而不是「异常」。
-                return {"ret": 0, "msgs": [], "get_updates_buf": sync_buf, "reconnect": True}
+            if "timed out" in str(exc).lower():
+                return {"ret": 0, "msgs": [], "get_updates_buf": sync_buf}
             raise
         if self._is_session_expired(resp):
             raise IlinkError("会话已失效（errcode -14），需要重新扫码登录")
@@ -515,7 +478,6 @@ class IlinkClient:
             url = str(full_url)
         else:
             raise IlinkError("媒体项缺少 encrypt_query_param / full_url")
-        # 注意 url 是**绝对地址**：_request 会识别出来直连，不要在前面拼 iLink base
         raw, _headers = self._request("GET", url, timeout=timeout, raw_response=True)
         key = parse_aes_key(str(aes_key_b64)) if aes_key_b64 else None
         return aes128_ecb_decrypt(raw, key) if key else raw
