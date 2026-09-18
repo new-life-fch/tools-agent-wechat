@@ -388,7 +388,6 @@ class InboxPoller(threading.Thread):
         self.last_poll_ts = 0.0
         self.last_error = ""
         self.inbound_count = 0
-        self.soft_reconnects = 0        # 服务端关闭空闲长轮询连接的次数（正常现象，不算错误）
 
     def _dedup(self, key: str) -> bool:
         if not key:
@@ -489,12 +488,6 @@ class InboxPoller(threading.Thread):
                 self.last_poll_ts = time.time()
                 self.last_error = ""
                 backoff = 0
-                if resp.get("reconnect"):
-                    self.soft_reconnects += 1
-                    if self.soft_reconnects == 1 or self.soft_reconnects % 20 == 0:
-                        print("[收] 服务端关闭了空闲的长轮询连接，已自动重连（第 %d 次；正常现象，不影响收信）"
-                              % self.soft_reconnects, flush=True)
-                    self.stop_event.wait(0.5)      # 稍等一下再连，别空转
                 new_buf = str(resp.get("get_updates_buf") or "")
                 for message in (resp.get("msgs") or []):
                     try:
@@ -689,8 +682,7 @@ def make_handler(cfg: Dict[str, Any], state: State, poller: Optional[InboxPoller
                     "uptime_sec": round(time.time() - started_at, 1),
                     "inbox": {"last_poll_ts": getattr(poller, "last_poll_ts", 0.0),
                               "last_error": getattr(poller, "last_error", ""),
-                              "count": getattr(poller, "inbound_count", 0),
-                              "reconnects": getattr(poller, "soft_reconnects", 0)},
+                              "count": getattr(poller, "inbound_count", 0)},
                     "heartbeat": hb,
                     "chats": list(state.chats().values()),
                 })
