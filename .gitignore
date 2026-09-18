@@ -8,3 +8,9 @@ wechat_media/
 __pycache__/
 *.pyc
 .DS_Store
+
+# --- VSCode 底框扩展的构建产物（该目录只在 feat/vscode-answer-panel 分支上有源码；
+#     main 上可能残留之前的 node_modules/.npm-cache 之类，必须挡住，否则一 commit 就是 100+MB）---
+vscode-answer-panel/node_modules/
+vscode-answer-panel/.npm-cache/
+vscode-answer-panel/.tmp-test/
