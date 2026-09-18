@@ -634,7 +634,84 @@ def test_code_image(root: str) -> None:
             check("图片尺寸合理", im.width > 400 and im.height > 100, "%dx%d" % (im.size))
 
 
-# ----------------------------- 主流程 -----------------------------
+def test_media_download(root: str) -> None:
+    print("\n[8] 媒体下载：绝对 URL 必须直连 CDN，不能被拼上 iLink base")
+    import base64 as _b64
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    sys.path.insert(0, HERE)
+    import ilink_client as il
+
+    key = bytes(range(16))
+    plain = b"\x89PNG\r\n\x1a\n" + (b"fake-image-payload" * 40)
+    cipher = il.aes128_ecb_encrypt(plain, key)
+    seen = {"ilink": [], "cdn": [], "cdn_auth": "未收到请求"}
+
+    class Cdn(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["cdn"].append(self.path)
+            seen["cdn_auth"] = self.headers.get("Authorization")
+            if self.path.startswith("/c2c/download"):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(cipher)))
+                self.end_headers()
+                self.wfile.write(cipher)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    class FakeIlink(BaseHTTPRequestHandler):
+        def do_GET(self):
+            # 修复前，下载请求会被错误地打到这边来（路径里嵌着完整绝对 URL）
+            seen["ilink"].append(self.path)
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    cdn = ThreadingHTTPServer(("127.0.0.1", 0), Cdn)
+    ilk = ThreadingHTTPServer(("127.0.0.1", 0), FakeIlink)
+    for srv in (cdn, ilk):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        client = il.IlinkClient(
+            token="t0ken",
+            base_url="http://127.0.0.1:%d" % ilk.server_address[1],
+            cdn_base_url="http://127.0.0.1:%d/c2c" % cdn.server_address[1])
+        item = {"type": 2, "image_item": {"media": {
+            "encrypt_query_param": "abc+/=def",
+            "aes_key": _b64.b64encode(key.hex().encode("ascii")).decode("ascii")}}}
+
+        try:
+            data, err = client.download_media(item, timeout=10), ""
+        except il.IlinkError as exc:
+            data, err = b"", str(exc)
+
+        check("绝对 URL 直连 CDN（iLink 侧一个请求都没收到）", seen["ilink"] == [],
+              "iLink 侧收到 %r" % (seen["ilink"][:1],))
+        check("下载 + AES 解密后与原文逐字节一致", data == plain, err or "%d bytes" % len(data))
+        check("请求路径与查询参数正确",
+              any(p.startswith("/c2c/download?encrypted_query_param=") for p in seen["cdn"]),
+              "%r" % (seen["cdn"][:1],))
+        check("请求 CDN 时不外发 bot 凭据", seen["cdn_auth"] is None, str(seen["cdn_auth"]))
+
+        try:
+            client._request("GET", "http://127.0.0.1:%d/nope" % cdn.server_address[1], raw_response=True)
+            msg = ""
+        except il.IlinkError as exc:
+            msg = str(exc)
+        check("报错里给的是真正请求的 URL（以前给入参，会骗人）",
+              "/nope" in msg and "ilinkai" not in msg, msg[:100])
+    finally:
+        cdn.shutdown()
+        ilk.shutdown()
+
+
+# ----------------------------- 主流程
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -666,7 +743,7 @@ def main() -> int:
                test_exclusive_owner,
                test_archived_session,
                test_wechat_source,
-               test_ilink_offline, test_code_image):
+               test_ilink_offline, test_code_image, test_media_download):
         try:
             fn(root)
         except Exception as exc:
