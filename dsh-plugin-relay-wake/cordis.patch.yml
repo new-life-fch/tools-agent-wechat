@@ -1,0 +1,16 @@
+# relay-wake 组合包层（bundle patch）。
+#
+# 只有走「正规安装」时才用得上：
+#     pnpm dsh plugin --profile web add /Users/fch/project/dp-workspace/one-person-agent/dsh-plugin-relay-wake
+#     # 然后重启 dsh web（dsh.profile.bundles 只在 boot 时读）
+#
+# 行名用**包名**引用，因为 pnpm 已经把本包链接进 profile 的 node_modules。
+# 若同时在 profile 的 cordis.patch.yml 里用绝对路径 insert 过同一行，
+# 两者会撞 id —— 二选一，别同时留。
+
+- insert:
+    - id: relay-wake
+      name: 'dsh-plugin-relay-wake'
+      config:
+        token: ''
+        maxWakesPerHour: 120
