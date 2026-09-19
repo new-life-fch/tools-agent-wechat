@@ -39,6 +39,30 @@ PY = sys.executable
 RESULTS = []
 
 
+SPAWNED: list = []          # 本套件起过的常驻子进程；结束时统一收掉，绝不留孤儿
+
+
+def popen(*args, **kwargs):
+    """subprocess.Popen 的登记版：测试起常驻进程一律走这里（否则会留下孤儿进程）。"""
+    proc = subprocess.Popen(*args, **kwargs)
+    SPAWNED.append(proc)
+    return proc
+
+
+def reap_spawned() -> int:
+    """收掉所有还活着的登记进程，返回收掉的数量。"""
+    killed = 0
+    for proc in SPAWNED:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            killed += 1
+    return killed
+
+
 def check(name: str, ok: bool, detail: str = "") -> bool:
     RESULTS.append((name, ok, detail))
     print("  %s %s%s" % ("✓" if ok else "✗ FAIL", name, ("  — " + detail) if detail else ""))
@@ -172,7 +196,7 @@ def test_blocking(root: str) -> None:
     shots = os.path.join(sub, "shots")
     os.makedirs(shots, exist_ok=True)
     cfg = make_cfg(sub, shot_dirs=[shots], idle_timeout_sec=1.2, poll_interval_sec=0.3)
-    proc = subprocess.Popen([PY, os.path.join(root, "wait_events.py"), "--config", cfg],
+    proc = popen([PY, os.path.join(root, "wait_events.py"), "--config", cfg],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     time.sleep(1.0)
     touch(os.path.join(shots, "live.png"))
@@ -194,7 +218,7 @@ def test_zero_event_blocks(root: str) -> None:
     shots = os.path.join(sub, "shots")
     os.makedirs(shots, exist_ok=True)
     cfg = make_cfg(sub, shot_dirs=[shots], idle_timeout_sec=1.5, poll_interval_sec=0.3)
-    proc = subprocess.Popen([PY, os.path.join(root, "wait_events.py"), "--config", cfg],
+    proc = popen([PY, os.path.join(root, "wait_events.py"), "--config", cfg],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     time.sleep(5.0)                                   # 3 倍以上空闲阈值
     if proc.poll() is not None:
@@ -297,7 +321,7 @@ def test_exclusive_owner(root: str) -> None:
     script = os.path.join(root, "wait_events.py")
 
     def spawn(session: str, *extra: str):
-        return subprocess.Popen([PY, script, "--config", cfg, "--owner-session", session, *extra],
+        return popen([PY, script, "--config", cfg, "--owner-session", session, *extra],
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     a = spawn("sess-A")
@@ -332,7 +356,7 @@ def test_exclusive_owner(root: str) -> None:
     # 驱逐记忆：被在线会话接管过之后，即使对方退出（owner 空窗）也抢不回来
     me = os.environ.get("DSH_SESSION_ID", "")
     if me:
-        a2 = subprocess.Popen([PY, script, "--config", cfg, "--owner-session", "sess-A2"],
+        a2 = popen([PY, script, "--config", cfg, "--owner-session", "sess-A2"],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         time.sleep(1.2)                                                     # A2 活着持有事件流
         subprocess.run([PY, script, "--config", cfg, "--owner-session", me, "--once"],
@@ -387,7 +411,7 @@ def test_archived_session(root: str) -> None:
                        capture_output=True, text=True, timeout=20, env=env)
     check("未归档时可正常启动", r.returncode == 0, "rc=%s" % r.returncode)
 
-    proc = subprocess.Popen([PY, script, "--config", cfg, "--owner-session", "sess-OLD"],
+    proc = popen([PY, script, "--config", cfg, "--owner-session", "sess-OLD"],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
     time.sleep(1.2)
     check("旧会话脚本正在阻塞等待", proc.poll() is None)
@@ -709,7 +733,7 @@ def test_session_probe(root: str) -> None:
     with open(lock, "w"):
         pass
     os.chmod(lock, 0o444)          # 只读：O_RDWR 打不开，只有 O_RDONLY 打得开
-    holder = subprocess.Popen(
+    holder = popen(
         [PY, "-c",
          "import fcntl,sys,time\n"
          "fh=open(sys.argv[1])\n"
@@ -854,6 +878,9 @@ def main() -> int:
     for name, ok, detail in RESULTS:
         if not ok:
             print("  ✗ %s  %s" % (name, detail))
+    leaked = reap_spawned()
+    if leaked:
+        print("[清理] 收掉 %d 个还活着的测试子进程（不留孤儿）" % leaked)
     if not args.keep:
         shutil.rmtree(root, ignore_errors=True)
     else:
