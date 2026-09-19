@@ -862,28 +862,35 @@ def render(cfg: Dict[str, Any], shots: ShotSource, wechat: WechatSource, state: 
            guard: "OwnerGuard", waker: Optional[Waker] = None) -> None:
     if not (cfg.get("output") or {}).get("banner", True):
         return
+    push = waker is not None and waker.enabled
     print("=== wait_events v%s ===" % VERSION)
     if "shots" in sources:
-        print("截图源: %s  (%s)" % (", ".join(shots.dirs), ", ".join(shots.globs)))
+        print("截图源: %s" % ", ".join(shots.dirs))
     if "wechat" in sources:
         age = wechat.heartbeat_age()
         status = "网关未运行" if age is None else ("网关心跳 %.0fs 前 ✓" % age if age <= 90 else "网关心跳 %.0fs 前 ⚠" % age)
         print("微信源: %s  (%s)" % (wechat.inbox, status))
         if wechat.warning:
             print("        ⚠ %s" % wechat.warning)
-    if waker is not None and waker.enabled:
-        print("模式: 常驻推送（不空闲退出）")
+    if push:
+        print("模式: 常驻推送")
         hold = "攒够 %.0fs 也推一次" % waker.max_hold if waker.max_hold > 0 else "持续有新事件就一直不推"
         print("推送: %s → 会话 %s" % (waker.url, waker.session))
         print("      静默去抖 %.1fs（最后一个事件之后安静这么久才推；%s）" % (waker.debounce, hold))
     elif waker is not None and waker.requested:
         print("模式: 阻塞（推送未启用：%s）" % (waker.blocker or "未知原因"))
-    print("轮询 %.1fs  空闲退出 %s  最长等待 %s  状态文件 %s"
-          % (interval, ("%.1fs" % idle) if idle > 0 else "关闭（零事件时一直等下去）",
-             ("%.0fs" % max_wait) if max_wait > 0 else "不限", state.path))
-    print("独占: %s pid %d（新会话启动会自动接管，被接管的旧脚本静默退出）"
-          % (guard.session or "非 DSH 环境", guard.pid))
-    print("等待新事件…（Agent 请保持阻塞，不要设超时）", flush=True)
+    tail = "  最长等待 %.0fs" % max_wait if max_wait > 0 else ""     # 默认不限，不占行
+    if push:
+        # 推送模式没有「空闲退出」这回事，别再打印它
+        print("轮询 %.1fs  状态文件 %s%s" % (interval, state.path, tail))
+    else:
+        print("轮询 %.1fs  空闲退出 %s  状态文件 %s%s"
+              % (interval, ("%.1fs" % idle) if idle > 0 else "关闭（零事件时一直等下去）", state.path, tail))
+    print("独占: %s pid %d" % (guard.session or "非 DSH 环境", guard.pid))
+    if push:
+        print("等待新事件…（本脚本常驻：有新事件会主动唤醒你；不用守着它，也不要重启）", flush=True)
+    else:
+        print("等待新事件…（Agent 请保持阻塞，不要设超时）", flush=True)
 
 
 def run(args: argparse.Namespace) -> int:
