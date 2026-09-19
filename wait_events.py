@@ -46,7 +46,8 @@
                       持续有新事件就一直不推（攒成一批），没有新事件就什么都不做。
                       推送成功才推进账本；失败保留、稍后重试，最多重复投递，绝不丢。
 
-退出码：0=正常（空闲超时安全退出，或 --once 完成）；2=配置/用法错误；130=被中断。
+退出码：0=正常（空闲超时安全退出，或 --once 完成）；2=配置/用法错误；4=被接管/会话结束（静默退出）；
+        5=推送连续失败（见 push.fail_limit，主动退出让 job 通知兜底）；130=被中断。
 """
 
 from __future__ import annotations
@@ -120,6 +121,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_text_chars": 8000,            # 单条推送正文上限，超出截断并标注
         "request_timeout_sec": 10.0,
         "retry_log_sec": 30.0,             # 连续失败时的日志限频
+        "fail_limit": 6,                   # 连续推送失败这么多次就主动退出（0=永不死等），
+                                           # 让 job 结算通知去叫醒 Agent —— 否则插件挂了就是黑洞
     },
 }
 
@@ -796,6 +799,7 @@ class Waker:
         self.max_text = max(200, int(cfg.get("max_text_chars", 8000) or 8000))
         self.timeout = max(1.0, float(cfg.get("request_timeout_sec", 10.0) or 10.0))
         self.retry_log_sec = max(1.0, float(cfg.get("retry_log_sec", 30.0) or 30.0))
+        self.fail_limit = max(0, int(cfg.get("fail_limit", 6) or 0))
         self.wechat_meta = bool(wechat_meta)
         self.blocker = ""
         if self.requested and not self.url:
@@ -994,6 +998,7 @@ def run(args: argparse.Namespace) -> int:
     pending_since: Optional[float] = None
     next_retry_at = 0.0
     last_push_error_at = 0.0
+    fail_streak = 0
     pushes = 0
 
     # ---- 启动时重放：上一轮打印了但没干净退出的事件 ----
@@ -1063,6 +1068,7 @@ def run(args: argparse.Namespace) -> int:
                     pending = []
                     pending_since = None
                     next_retry_at = 0.0
+                    fail_streak = 0
                     pushes += 1
                     state.clear_unacked()                      # 送达才确认
                     if wechat:
@@ -1079,11 +1085,19 @@ def run(args: argparse.Namespace) -> int:
                     print("--- 已推送 %d 条事件 → 会话 %s（agent status=%s）---"
                           % (len(batch), waker.session, info or "?"), flush=True)
                 else:
+                    fail_streak += 1
                     if now - last_push_error_at >= waker.retry_log_sec:   # 失败限频播报
                         last_push_error_at = now
                         print("--- 推送失败（%s）：%d 条事件保留在批次里，稍后重试 ---"
                               % (info, len(pending)), file=sys.stderr, flush=True)
                     next_retry_at = now + (60.0 if "429" in info else 5.0)
+                    if waker.fail_limit > 0 and fail_streak >= waker.fail_limit:
+                        # 插件挂了/配置错了：一直常驻就等于「谁也不叫醒 Agent」的黑洞。
+                        # 主动退出让 job 结算通知顶上（预算够的话会把 Agent 叫醒来看这条错误）。
+                        print("--- 推送连续失败 %d 次（最后一次：%s）：本脚本主动退出，"
+                              "改由 job 结算通知叫醒 Agent 处理；%d 条事件留在账本里，下次运行补推 ---"
+                              % (fail_streak, info, len(pending)), file=sys.stderr, flush=True)
+                        return 5
 
         if args.once:                          # 自测：扫完（并推完）就退
             break
