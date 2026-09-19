@@ -64,13 +64,20 @@ py -3 -m venv .venv
 .venv\Scripts\python wechat_gateway.py login --new
 .venv\Scripts\python wechat_gateway.py serve
 .venv\Scripts\python start_capture.py
-.venv\Scripts\python wait_events.py
+.venv\Scripts\python wait_events.py --push
 ```
 
 Windows 备注：
 - 控制台若出现中文乱码，先 `chcp 65001` 或 `set PYTHONUTF8=1`；脚本已做 `errors="replace"` 兜底，**不会因编码问题崩溃**。
 - PowerShell 里路径用 `.venv\Scripts\python.exe`；`&&` 连接命令请改用 `;` 或分次执行。
 - 端口占用识别走 `netstat -ano` + `tasklist`（macOS/Linux 走 `lsof`）。
+- **日志看起来「卡住不打印、按一下 Enter 才刷出来」**：这是 CMD 窗口的**快速编辑模式**（鼠标点进/划选窗口就冻结输出），
+  不是脚本缓冲问题（本仓库脚本每行都 `flush`）。处理：用 **Windows Terminal** 跑，或右键标题栏 →「属性/默认值」→
+  选项 → 取消勾选「快速编辑模式」；**Ctrl+C 停不掉进程**也是同一个原因（选择状态下 Ctrl+C 被控制台拿去做复制），
+  先按一下 Enter 取消选择再 Ctrl+C，或 `taskkill /F /PID <pid>`。
+- **推送模式（`--push`）需要 DSH 装在 Windows 这台机器上**，并装 `relay-wake` 插件（两种装法见
+  `dsh-plugin-relay-wake/README.md`，Windows 路径用 `C:/...` 正斜杠）。中继脚本侧是纯 Python 标准库，
+  装好插件 + token 对上即可；只监听回环、不新开端口，不会触发防火墙弹窗。
 
 ## 把工具发给别人（对方要扫自己的码）
 
@@ -125,6 +132,17 @@ $P wait_events.py --push
 
 为什么不再靠「脚本退出 → job 结算通知」：那条通知受 `tool-jobs.maxConsecutiveWakes`
 预算限制（默认连续 3 次），用完就只进收件箱不唤醒——实测出现过 **47 分 54 秒空窗**。
+
+**推送通道怎么装（macOS / Windows 通用，详见 `dsh-plugin-relay-wake/README.md`）**：
+
+- **免安装热载**（本机自用最省事，不用重启）：在 `~/.dsh/profiles/web/cordis.patch.yml`
+  里 insert 一行，`name` 写 `dsh-plugin-relay-wake/index.js` 的绝对路径（Windows 用 `C:/...` 正斜杠）。
+  保存即生效，回滚就删掉这一段。
+- **官方 bundle**（可分发到别的机器）：在 DSH 检出目录里
+  `pnpm dsh plugin --profile web add <dsh-plugin-relay-wake 的路径>`，然后重启一次 `dsh web`
+  （重启会杀掉后台任务，起来后重新拉起截图端/网关/推送脚本）。卸载 `remove` 同理。
+- 两种方式**只能二选一**（同一个行 id），token 必须与 `wait_events.json` 的 `push.token` 一致；
+  生成：`python -c "import secrets;print(secrets.token_hex(16))"`。
 
 **顺序无所谓**（三个进程互不依赖），但要「先全起来，再让用户按热键」。
 各步的存活验证：
