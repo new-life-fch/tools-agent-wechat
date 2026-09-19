@@ -6,7 +6,7 @@ metadata: { "tags": "study, relay, wechat, screenshot, resident-push, exam" }
 
 # study-wechat-relay — 截图答题 → 微信回传
 
-工具链固定在 `/Users/fch/project/dp-workspace/one-person-agent/`。**不要重写脚本、不要自己写轮询循环**，
+工具链固定在 `/Users/fch/project/dp-workspace/one-person-agent/`。
 按下面的命令用。
 
 ```
@@ -20,8 +20,8 @@ metadata: { "tags": "study, relay, wechat, screenshot, resident-push, exam" }
                                          └─► vscode_notify.py  ──► 编辑器「答题板」（附送）
 ```
 
-**关键区别**：你不是在等一个阻塞进程，而是**被主动叫醒**。所以起完推送脚本就可以结束本轮，
-什么都不用守着；下一批事件到来时脚本会开新 turn，事件清单直接出现在那条消息里。
+**关键**：你会被常驻进程主动唤醒，所以起完常驻推送脚本就可以结束本轮，
+什么都不用守着；下一批事件到来时脚本会唤醒你，事件清单直接出现在那条消息里。禁止杀掉常驻推送脚本、网关、截图脚本（用户要求除外），这三个脚本常驻后台。
 
 ## 0. 开工前
 
