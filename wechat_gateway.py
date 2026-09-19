@@ -79,7 +79,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "send": {"chunk_size": 1800, "chunk_delay_sec": 1.2, "retries": 4, "retry_delay_sec": 1.0,
              "typing": True, "max_file_mb": 30},
     "inbox": {"download_media": True, "max_media_mb": 50, "poll_timeout_ms": 35000,
-              "dedup_window": 2000, "keep_media_days": 0, "heartbeat_interval_sec": 15},
+              "dedup_window": 2000, "dedup_ttl_sec": 10, "keep_media_days": 0,
+              "heartbeat_interval_sec": 15},
     "log": {"level": "info"},
 }
 
@@ -384,18 +385,31 @@ class InboxPoller(threading.Thread):
         self.stop_event = stop_event
         self.echo = echo
         self.seen: "queue.Queue[str]" = queue.Queue()
-        self._seen_ids: List[str] = []
+        self._seen_ids: List[Tuple[str, float]] = []      # (key, 记入时刻)：**短窗口**去重
         self.last_poll_ts = 0.0
         self.last_error = ""
         self.inbound_count = 0
         self.soft_reconnects = 0        # 服务端关闭空闲长轮询连接的次数（正常现象，不算错误）
 
-    def _dedup(self, key: str) -> bool:
+    def _dedup(self, key: str, label: str = "") -> bool:
+        """**短窗口**去重：只挡「同一条消息被服务端重投」，不挡用户过一会儿又说同样的话。
+
+        以前是「最近 2000 个键、无时间上限」——同一个网关进程活着的期间，用户第二次发
+        同一句话会被当成重复投递**静默丢掉**（不写收件箱、不打日志、游标照常前进）。
+        实测踩过：连发两条「测试」，只有第一条有回应。
+        现在按 `inbox.dedup_ttl_sec`（默认 10 秒）过期；<=0 表示退回旧行为（不按时间过期）。
+        """
         if not key:
             return False
-        if key in self._seen_ids:
+        now = time.time()
+        ttl = float(self.state.cfg["inbox"].get("dedup_ttl_sec", 10) or 0)
+        if ttl > 0:
+            self._seen_ids = [item for item in self._seen_ids if now - item[1] <= ttl]
+        if any(item[0] == key for item in self._seen_ids):
+            if label:
+                print("[收] 忽略重复投递（%.0fs 内同一条：%s）" % (ttl, label), flush=True)
             return True
-        self._seen_ids.append(key)
+        self._seen_ids.append((key, now))
         limit = int(self.state.cfg["inbox"].get("dedup_window", 2000))
         if len(self._seen_ids) > limit:
             self._seen_ids = self._seen_ids[-limit:]
@@ -430,11 +444,11 @@ class InboxPoller(threading.Thread):
         msg_id = str(message.get("message_id") or "").strip()
         if not sender or sender == account_id:
             return
-        if self._dedup("id:%s" % msg_id if msg_id else ""):
+        if self._dedup("id:%s" % msg_id if msg_id else "", "msg_id=%s" % msg_id):
             return
         item_list = message.get("item_list") or []
         text = extract_text(item_list)
-        if text and self._dedup("text:%s:%s" % (sender, text[:200])):
+        if text and self._dedup("text:%s:%s" % (sender, text[:200]), "同文本 %r" % text[:40]):
             return
         chat_type, chat_id = chat_identity(message, account_id)
         if not chat_id:
@@ -458,6 +472,8 @@ class InboxPoller(threading.Thread):
             seq = self.state.next_seq()
 
         if not text and not media:
+            print("[收] 忽略空消息（既无文本、也无可下载媒体）: types=%s sender=%s"
+                  % ([str(item.get("type")) for item in item_list], sender[:12]), flush=True)
             return
         record = {
             "seq": seq,

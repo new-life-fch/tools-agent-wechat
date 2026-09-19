@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 def _console_safe() -> None:
@@ -835,6 +836,48 @@ def test_media_download(root: str) -> None:
 
 # ----------------------------- 主流程 -----------------------------
 
+def test_gateway_dedup_ttl(root: str) -> None:
+    """网关的「按内容去重」必须按时间过期。
+
+    旧实现是「最近 2000 个键、无时间上限」：同一个网关进程活着的期间，用户第二次发同一句话
+    会被当成重复投递**静默丢掉**（不写收件箱、不打日志、游标照常前进）。
+    实测事故：用户在微信里连发「测试」，第一条有回应，后面几条全部消失。
+    """
+    import importlib
+    sys.path.insert(0, HERE)
+    gw = importlib.import_module("wechat_gateway")
+
+    tmp = tempfile.mkdtemp(prefix="dedup_", dir=root)
+    cfg = json.loads(json.dumps(gw.DEFAULT_CONFIG))
+    cfg.update({"account_id": "acct@im.bot", "state_dir": os.path.join(tmp, "state"),
+                "inbox_file": os.path.join(tmp, "inbox.jsonl"), "media_dir": os.path.join(tmp, "media")})
+    cfg["inbox"]["download_media"] = False
+    cfg["inbox"]["dedup_ttl_sec"] = 1.0
+    state = gw.State(cfg)
+    poller = gw.InboxPoller(gw.IlinkClient(), state, threading.Event())
+
+    def feed(text: str, mid: str) -> None:
+        poller.handle_message({"from_user_id": "u@im.wechat", "message_id": mid,
+                               "item_list": [{"type": 1, "text_item": {"text": text}}],
+                               "chat_id": "u@im.wechat", "chat_type": 1})
+
+    def rows() -> int:
+        try:
+            return sum(1 for line in open(state.inbox_path, encoding="utf-8") if line.strip())
+        except OSError:
+            return 0
+
+    feed("测试", "m1")
+    check("首次同文本消息正常入箱", rows() == 1, "rows=%d" % rows())
+    feed("测试", "m2")
+    check("窗口内同文本重投被挡掉（服务端重投保护仍在）", rows() == 1, "rows=%d" % rows())
+    time.sleep(1.2)
+    feed("测试", "m3")
+    check("**过了窗口再发同一句话必须收（旧 bug 就死在这里）**", rows() == 2, "rows=%d" % rows())
+    feed("测试 1", "m4")
+    check("不同文本照常收", rows() == 3, "rows=%d" % rows())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="保留临时目录")
@@ -866,7 +909,7 @@ def main() -> int:
                test_archived_session,
                test_wechat_source,
                test_ilink_offline, test_code_image, test_vscode_panel,
-               test_session_probe, test_media_download):
+               test_session_probe, test_media_download, test_gateway_dedup_ttl):
         try:
             fn(root)
         except Exception as exc:
