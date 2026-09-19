@@ -6,8 +6,8 @@ metadata: { "tags": "study, relay, wechat, screenshot, resident-push, exam" }
 
 # study-wechat-relay — 截图答题 → 微信回传
 
-工具链固定在 `/Users/fch/project/dp-workspace/one-person-agent/`。
-按下面的命令用。
+工具链在仓库的 `one-person-agent/` 目录（下文记作 `$OA`），Python 用工作区共享 venv（下文记作 `$PY`）。
+**不要重写脚本、不要自己写轮询循环**，按下面的命令用。
 
 ```
 用户按 Ctrl+` ──► shots/*.png ─┐
@@ -29,8 +29,25 @@ metadata: { "tags": "study, relay, wechat, screenshot, resident-push, exam" }
 export PY=/Users/fch/project/dp-workspace/.venv/bin/python OA=/Users/fch/project/dp-workspace/one-person-agent
 ```
 
-> ⚠️ 每次 bash 调用都是全新 shell，`$PY`/`$OA` 不会跨调用保留——下面所有 `$PY $OA/...` 的命令，
-> 每条前面都要重带这一行（或直接写绝对路径）。
+```powershell
+# Windows（DSH 在 Windows 上给 Agent 的是 PowerShell，不是 bash）
+$PY = "C:\path\to\.venv\Scripts\python.exe"; $OA = "C:\path\to\one-person-agent"
+```
+
+> ⚠️ 每次 shell 调用都是全新 shell，`$PY`/`$OA` 不会跨调用保留——下面所有 `$PY $OA/...` 的命令，
+> 每条前面都要重带这两行（或直接写绝对路径）。
+
+本文档下面的命令一律用 POSIX 写法；**Windows 上只有这几处要换**：
+
+| 写法 | macOS / Linux | Windows（PowerShell） |
+|---|---|---|
+| 变量当命令用 | `$PY $OA/wait_events.py --push` | `& $PY "$OA\wait_events.py" --push`（`&` 不能省） |
+| 路径分隔 | `/` | `\`（或 `/`，Python 都吃） |
+| 环境变量 | `export PY=…` | `$PY = "…"` |
+| 批次目录 | `B=$OA/work/$(date +%Y%m%d_%H%M%S) && mkdir -p $B` | `$B = Join-Path $OA ("work\" + (Get-Date -Format yyyyMMdd_HHmmss)); mkdir $B` |
+| 搜代码 | `grep -n "…" solution.go` | 用你自己的 grep 工具，或 `Select-String -Path solution.go -Pattern "…"` |
+| HTTP 探测 | `curl -s <url>` | **`curl.exe -s <url>`**（PowerShell 里 `curl` 是 `Invoke-WebRequest` 的别名，`-s` 会报错） |
+| 连多条命令 | `a && b` | `a; b` |
 
 三个常驻进程供血，**缺一个就等不到事件**。各查一句，缺哪个起哪个：
 
@@ -94,12 +111,15 @@ bash({ command: "$PY $OA/wait_events.py --push", run_in_background: true })   �
 产物落盘，每题一个批次目录：
 
 ```bash
-B=$OA/work/$(date +%Y%m%d_%H%M%S) && mkdir -p $B   # 记下绝对路径；$B 同样不跨 bash 调用保留
+B=$OA/work/$(date +%Y%m%d_%H%M%S) && mkdir -p $B   # 记下绝对路径；$B 同样不跨 shell 调用保留
+# Windows：# $B = Join-Path $OA ("work\" + (Get-Date -Format yyyyMMdd_HHmmss)); mkdir $B
 ```
 
 - **算法题**：写 `$B/solution.<ext>`，然后真的跑样例：
   - ACM 模式：样例输入存 `$B/t1.in` 直接跑并比对——Go `go run $B/solution.go < $B/t1.in`；
     Python `$PY $B/solution.py < $B/t1.in`；C++ `g++ -O2 -o $B/a $B/solution.cpp && $B/a < $B/t1.in`。
+    ⚠️ **PowerShell 没有 `<` 输入重定向**，Windows 上改成管道：`Get-Content $B\t1.in | go run $B\solution.go`
+    （或 `cmd /c "go run $B\solution.go < $B\t1.in"`）。
   - 核心代码模式：写 `$B/run_tests.py` 调用你的函数/类，断言所有样例。
   - **全部样例通过**才继续；不过就改，最多绕 3 轮，仍不过就如实告诉用户卡在哪。
 - **非算法题**：直接核对选项/空；不确定的把依据写清楚。
@@ -122,7 +142,8 @@ for ; q > 0; q-- {
 }
 ```
 
-> 发代码图和源码文件前自查：`grep -n "bufio.NewWriter\|os.Stdout.Write\|fmt.Scan(" solution.go` 不该有命中。
+> 发代码图和源码文件前自查：搜一下 `bufio.NewWriter` / `os.Stdout.Write` / `fmt.Scan(` 不该有命中
+> （用自己的 grep 工具；Windows PowerShell 用 `Select-String`）。
 
 ### 步骤 4 — 发到微信（+ 顺手铺到 VSCode 底框）
 
@@ -247,6 +268,8 @@ $PY $OA/wechat_gateway.py send --text "…思路…
 
 ```bash
 P=/Users/fch/project/dp-workspace/.venv/bin/python; cd /Users/fch/project/dp-workspace/one-person-agent
+# Windows：# $P = "C:\path\to\.venv\Scripts\python.exe"; cd C:\path\to\one-person-agent
+#          调用时加 & ：& $P wait_events.py --push
 
 $P wait_events.py --push                  # 常驻推送（唯一跑法：后台起一次，之后别管它）
 $P wait_events.py --push --debounce 15    # 改静默去抖时长
