@@ -1,7 +1,7 @@
 ---
 name: study-wechat-relay
-description: 学习场景「截图 → 解题 → 微信回传」中继循环。用户在前台按 Ctrl+` 截图（或直接在微信里给机器人发消息），Agent 用阻塞脚本等待新事件 → 读图识题 → 解题验证 → 把答案发回微信 → 再回到阻塞等待，如此往复。Use when the user asks for 刷题助手 / 截图答题 / 答案发微信 / 学习中继 / 帮我盯着截图和微信 / study relay.
-metadata: { "tags": "study, relay, wechat, screenshot, blocking-wait, exam" }
+description: 学习场景「截图 → 解题 → 微信回传」中继循环。用户在前台按 Ctrl+` 截图（或直接在微信里给机器人发消息），Agent 起一个**常驻推送脚本**，有新事件时脚本会主动唤醒 Agent（最多静默 8 秒）→ 读图识题 → 解题验证 → 把答案发回微信 → 继续等下一批，如此往复。Use when the user asks for 刷题助手 / 截图答题 / 答案发微信 / 学习中继 / 帮我盯着截图和微信 / study relay.
+metadata: { "tags": "study, relay, wechat, screenshot, resident-push, exam" }
 ---
 
 # study-wechat-relay — 学习场景截图答题中继
@@ -11,13 +11,21 @@ metadata: { "tags": "study, relay, wechat, screenshot, blocking-wait, exam" }
 
 ```
 用户按 Ctrl+` 截图 ──► shots/*.png ─┐
-                                    ├─► wait_events.py（阻塞）──► Agent 识图解题
-用户在微信里发消息 ──► 收件箱 JSONL ─┘                                    │
-                                                                          ├─► wechat_gateway.py ──► 微信（主通道）
-                                                                          └─► vscode_notify.py  ──► 编辑器底部「答题板」（附送）
-                                                                          │
-                                                          再次阻塞等待 ◄───┘
+                                    ├─► wait_events.py --push（常驻）──► 主动唤醒 Agent 识图解题
+用户在微信里发消息 ──► 收件箱 JSONL ─┘         │                              │
+                                               │                              ├─► wechat_gateway.py ──► 微信（主通道）
+                                               │                              └─► vscode_notify.py  ──► 编辑器底部「答题板」（附送）
+                                               └── 下一批事件自动唤醒 ◄────────┘
 ```
+
+**两种运行模式**（由 `--push` 决定，别搞混）：
+
+| | 推送模式 `--push`（推荐） | 阻塞模式（默认，备用） |
+|---|---|---|
+| 脚本 | **常驻不退出**；新事件静默 N 秒后主动唤醒你 | 打印事件 → 空闲 N 秒 → 自己退出 |
+| 唤醒靠 | `relay-wake` 插件调 `Agent.followup()` → **直接开新 turn** | DSH 的 job 结算通知（受 `maxConsecutiveWakes` 预算限制：连续 3 次后降级为不唤醒） |
+| 你的活 | 起一次就别管；被唤醒 → 处理 → 结束本轮 | 每次拿到 `completed` 都要**再起一轮** |
+| 已知风险 | 脚本崩了要你自己发现（`job_list` 里没了） | 预算耗尽 → 长时间没人接（实测 47 分钟空窗） |
 
 > 开跑之前先读一遍全文，特别是「铁律」和「异常处理手册」——这套流程的成败几乎全在纪律上。
 
@@ -93,30 +101,34 @@ $PY $OA/start_capture.py --print-cmd      # 看截图端会用哪个端口/目�
 优先用后台任务 + 阻塞读取（DSH / 支持后台 job 的运行时）：
 
 ```
+1) bash({ command: "$PY $OA/wait_events.py --push", run_in_background: true })   → 拿到 job_id
+2) 起完这一轮就可以收工：**不要** job_output(wait) 死等它、**不要**因为「它在跑但没输出」重开
+     · 有新事件：它静默 N 秒（默认 8s）后自己唤醒你 → 新一轮的对话里直接带事件清单（IMG/WX 行）
+     · 没新事件：它什么都不做（不推送、不唤醒），这是设计，不是卡死
+3) 只有两种情况才重开：① `job_list` 显示那个 job 已经 completed（脚本崩了），② 用户明确要求重启
+```
+
+推送失败不会丢：脚本把事件留在账本里，5 秒后重试；推不出去就一直在（重启后也会补推）。
+
+**没插件时退回阻塞模式**（`curl -s http://127.0.0.1:3080/relay/health` 不通、或启动横幅写「推送未启用」）：
+
+```
 1) bash({ command: "$PY $OA/wait_events.py", run_in_background: true })   → 拿到 job_id
-2) 立刻进入等待循环：反复 job_output(job_id, wait: true)
-     · 返回 [status: running]  → 继续调，这是正常现象，不是失败
-     · 返回 [status: completed] → 取本轮输出，进入步骤 2
-3) 整轮期间：不要 job_kill、不要因为「等太久」重开一个、不要改用 --once 反复问
+2) 反复 job_output(job_id, wait: true)：running = 继续等（正常）；completed = 取输出，进入步骤 2
+3) 处理完必须**再起一轮**（见步骤 5）
 ```
 
 如果运行时没有后台任务，就在前台跑，并把 `timeoutMs` 设成运行允许的最大值；
 万一被超时杀掉，**直接再跑一次就行**：账本保证已打印过的不重复打印，而被杀掉那一轮
 **已经打印但没来得及被你看到**的，会在下次运行的 `REPLAY` 行里补给你（见 §3）。
 
-- 想看单轮快照（调试/自测）才用：`$PY $OA/wait_events.py --once`
-- **空闲退出的准确语义**：`--idle-timeout` 默认 10s，但计时**从打印出第一个事件之后才开始**。
-  - 一个事件都没打印过 → **它永远不退出**，一直阻塞等第一次截图/第一条微信。此时屏幕上只有横幅、
-    什么都没有，这是**完全正常**的，不是卡死：不要重开、不要加超时、不要改成 `--once` 去轮询试探。
-  - 打印过事件之后 → 最后一条事件之后空闲 10s 就安全退出。
-  - 只有想给整轮加个总时长保险时才用 `--max-wait <秒>`（默认 0 = 不限，不用动；它是零事件阻塞时唯一的自动退出口）。
-- 超时退出不会丢事件：下次运行会把没处理完的以 `REPLAY` 补给你。
+- 想看单轮快照（调试/自测）才用：`$PY $OA/wait_events.py --once`（`--push` 下它会扫完就推、推完即退）
 - 输出里只有以 `IMG ` / `WX ` 开头的行才是事件；横幅与结尾统计忽略即可。
+- 推送模式横幅长这样：`模式: 常驻推送（不空闲退出）` + `推送: http://127.0.0.1:3080/relay/wake → 会话 session-…`
+  + `静默去抖 8.0s`。看到这三行就说明插件通道是活的。
 - **同一时刻只有一个等待脚本**：脚本带独占登记，新会话启动会自动接管。被接管的旧脚本会**静默退出**
   （提示「事件流已被 … 接管」，退出码 4；再启动则码 3 且提示「本会话已被 … 接管」）——
   看到这两条就**不要重启本脚本**，这个会话已经不是监听者，事件交给当前会话即可，一条都不会丢。
-  脚本空闲退出后 10 分钟内事件流仍保留给本会话（防止两个会话在"解题空窗期"互相抢），
-  确实要强行换会话监听才用 `--force-owner`。
 
 ### 步骤 2 — 读图 / 读消息
 
@@ -197,10 +209,13 @@ $PY $OA/wechat_gateway.py send \
 发送成功判定：命令输出 `[结果] 成功 …`（退出码 0）。失败见 §5。
 **注意**：不要向用户提问或给出选项卡，用户发现长时间没有收到微信消息，会在微信中输入消息，激活通信，在此期间，你保持阻塞脚本运行并等待
 
-### 步骤 5 — 回到步骤 1
+### 步骤 5 — 回到等待
 
-只要本轮还有没处理完的事件（一次等待可能返回多张图 / 多条消息），先把它们处理完，
-然后**立刻**再次进入步骤 1 的阻塞等待。不要问用户「还要继续吗」，不要打印总结后就停下。
+- **推送模式（默认）**：什么都不用做——脚本还在跑，处理完这批事件就结束本轮；
+  下一批事件到来时它会自己唤醒你。**不要重启脚本**（除非 `job_list` 里那个 job 已经不在了）。
+- **阻塞模式（备用）**：先把本轮没处理完的事件处理完，**立刻**再起一轮等待（步骤 1 的备用写法）。
+
+两边都一样：不要问用户「还要继续吗」，不要打印总结后就停下。
 
 ## 3. 事件格式与解析
 
@@ -268,7 +283,11 @@ $PY $OA/wechat_gateway.py send --text "…思路…
 | `send` 报 **HTTP 4xx/网络错误** | `$PY $OA/wechat_gateway.py doctor`：token 失效就 `$PY $OA/wechat_gateway.py login --new` 重新扫码（**二维码必须用户本人扫**，Agent 不能代扫）|
 | 用户说「这是别人的包 / 我要用自己的微信」 | 跑 `$PY $OA/wechat_gateway.py login --new`：它会申请**全新二维码**，扫完就是用户自己的机器人；不加 `--new` 只会沿用包里原有的身份 |
 | 图片发出去是**灰块** | 说明 aes_key 参数被改坏了。别自己改协议，恢复 `ilink_client.py` 后重发 |
-| `wait_events` 一直没输出（几分钟甚至几十分钟） | **正常**：零事件时它就是要一直阻塞。确认网关活着（`/health` 的 `count` 是否增长）与截图端是否在跑即可；**不要**改短超时、不要重开 |
+| `wait_events --push` 起来了但一直没被唤醒 | **正常**：没有新事件它就不推、不唤醒。别重启、别改成 `--once` 去轮询试探；确认截图端/网关在跑即可（`/health`、`job_list` 里那个 job 还是 running） |
+| `--push` 横幅写「推送未启用：…」 | 推送通道没配好（缺 url/会话 id）。先 `curl -s http://127.0.0.1:3080/relay/health` 看插件在不在；不在就退回阻塞模式（步骤 1 备用），并告诉用户需要装/启 `relay-wake` 插件 |
+| 日志出现「推送失败（…）：N 条事件保留…」 | 不用管，脚本 5 秒后自己重试；连续失败才需要看：`404 session-not-live` = 目标会话的 agent 不在了（在 GUI 里打开该会话即可恢复），`401 bad-token` = token 与插件配置不一致 |
+| `job_list` 里那个 `--push` job 已经是 **completed** | 脚本崩了（唯一需要重开的信号）。看它的输出定位原因，然后按步骤 1 重开一次 |
+| `wait_events` 一直没输出（阻塞模式，几分钟甚至几十分钟） | **正常**：零事件时它就是要一直阻塞。确认网关活着（`/health` 的 `count` 是否增长）与截图端是否在跑即可；**不要**改短超时、不要重开 |
 | 图片读不出来（坏文件/半截） | 跳过它，继续处理其余事件；在图里说明「这张图读取失败，麻烦重截」 |
 | 截图里**没有题目**（截到了桌面/聊天窗/文档） | 发一条微信说明「没识别到题目，请把题面放到屏幕可见处再按一次」，然后**立刻回去等待**，不要假装答过 |
 | 用户在微信里发的是**纯聊天/催问** | 直接回，不用走解题流程；同时继续等待 |
@@ -310,9 +329,12 @@ $P wechat_gateway.py doctor              # 自检
 $P wechat_gateway.py send --text "..."   # 发文本；--image/--file 可多次
 $P wechat_gateway.py inbox --since 0     # 看收件箱
 $P wechat_gateway.py chats               # 已知会话（拿 chat_id）
-$P wait_events.py                        # 阻塞等待（默认配置）
-$P wait_events.py --status               # 看账本
-$P wait_events.py --once                 # 只扫一遍（调试）
+$P wait_events.py                        # 阻塞等待（备用模式：打印 → 空闲退出，靠 job 通知唤醒）
+$P wait_events.py --push                 # 常驻推送（推荐：新事件静默 8s 后主动唤醒 Agent）
+$P wait_events.py --push --debounce 15    # 改静默时长（持续有新事件就一直不推）
+$P wait_events.py --status               # 看账本 + 推送计数
+$P wait_events.py --once                 # 只扫一遍（调试；--push 下扫完就推、推完即退）
+curl -s http://127.0.0.1:3080/relay/health   # relay-wake 插件：唤醒计数 / 活着的会话列表
 $P code_image.py --in a.py --out a.png --lang python --title "T1"   # 代码转图片
 $P vscode_notify.py push -t "第3题" -f $B/answer.md   # 铺到编辑器底部「答题板」
 $P vscode_notify.py status                # 看有没有活着的面板（退出码 2 = 没有）

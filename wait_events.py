@@ -32,6 +32,20 @@
     python wait_events.py --reset               # 清空状态（下次会重放未确认项）
     python wait_events.py --json                # 输出 JSON 行（机器解析）
 
+推送模式（--push，推荐跑法，见下）::
+
+    python wait_events.py --push                # 常驻：有新事件且静默 N 秒后主动唤醒 Agent
+
+两种模式的区别::
+
+    阻塞模式（默认）  打印事件 → 空闲 N 秒 → 自己退出；靠「job 结算通知」去叫醒 Agent，
+                      而那条通知受 tool-jobs 的 maxConsecutiveWakes 预算限制（默认 3 次），
+                      预算用完后只进收件箱不唤醒 —— 会出现长时间没人接的空窗。
+    推送模式（--push）常驻不退出；事件先攒着，**最后一个事件之后安静 N 秒**才 POST 给
+                      DSH 的 relay-wake 插件，由它调 Agent.followup() 直接开一个新 turn。
+                      持续有新事件就一直不推（攒成一批），没有新事件就什么都不做。
+                      推送成功才推进账本；失败保留、稍后重试，最多重复投递，绝不丢。
+
 退出码：0=正常（空闲超时安全退出，或 --once 完成）；2=配置/用法错误；130=被中断。
 """
 
@@ -45,6 +59,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 def _console_safe() -> None:
@@ -93,6 +109,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_batch": 20,
     },
     "output": {"format": "lines", "wechat_show_meta": False, "banner": True},
+    "push": {
+        "_readme": "推送模式：把新事件主动推给 DSH 的 relay-wake 插件，由它唤醒空闲会话",
+        "enabled": False,                  # true = 常驻推送模式（不再空闲退出）；也可用 --push
+        "url": "http://127.0.0.1:3080/relay/wake",
+        "token": "",                       # 与插件行里的 config.token 一致
+        "session": "",                     # 唤醒目标会话；留空 = --owner-session / DSH_SESSION_ID
+        "debounce_sec": 8.0,               # 最后一个事件之后安静这么久才推送（用户语义：静默去抖）
+        "max_hold_sec": 0,                 # >0 = 即使持续有新事件，攒够这么久也推一次（0=一直不推）
+        "max_text_chars": 8000,            # 单条推送正文上限，超出截断并标注
+        "request_timeout_sec": 10.0,
+        "retry_log_sec": 30.0,             # 连续失败时的日志限频
+    },
 }
 
 
@@ -748,11 +776,86 @@ class WechatSource:
         return out
 
 
+# ----------------------------- 推送唤醒 -----------------------------
+
+class Waker:
+    """把一批事件主动推给 DSH 的 relay-wake 插件，由它唤醒空闲会话。
+
+    语义（用户定的，别改）：**静默去抖** —— 事件先攒着，最后一个事件之后安静
+    `debounce_sec` 秒才推送；期间持续有新事件就一直不推（继续攒成一批）。
+    推送成功才推进账本；失败保留待重试 —— 最多重复投递，绝不丢。
+    """
+
+    def __init__(self, cfg: Dict[str, Any], session_id: str, wechat_meta: bool = False) -> None:
+        self.requested = bool(cfg.get("enabled"))
+        self.url = str(cfg.get("url") or "").strip()
+        self.token = str(cfg.get("token") or "")
+        self.session = str(cfg.get("session") or session_id or "").strip()
+        self.debounce = max(0.0, float(cfg.get("debounce_sec", 8.0) or 0.0))
+        self.max_hold = max(0.0, float(cfg.get("max_hold_sec", 0) or 0.0))
+        self.max_text = max(200, int(cfg.get("max_text_chars", 8000) or 8000))
+        self.timeout = max(1.0, float(cfg.get("request_timeout_sec", 10.0) or 10.0))
+        self.retry_log_sec = max(1.0, float(cfg.get("retry_log_sec", 30.0) or 30.0))
+        self.wechat_meta = bool(wechat_meta)
+        self.blocker = ""
+        if self.requested and not self.url:
+            self.blocker = "缺 push.url"
+        elif self.requested and not self.session:
+            self.blocker = "缺会话 id（push.session / --owner-session / DSH_SESSION_ID 都没有）"
+
+    @property
+    def enabled(self) -> bool:
+        return self.requested and not self.blocker
+
+    def render(self, events: List[Event]) -> str:
+        img = sum(1 for e in events if e.kind == "IMG")
+        wx = sum(1 for e in events if e.kind == "WX")
+        lines = ["[relay] %d 个新事件（截图 %d / 微信 %d）" % (len(events), img, wx)]
+        lines.extend(event.to_line(self.wechat_meta) for event in events)
+        text = "\n".join(lines)
+        if len(text) > self.max_text:
+            text = text[: self.max_text] + "\n…[清单过长已截断，完整内容见本脚本日志]"
+        return text
+
+    def push(self, events: List[Event]) -> Tuple[bool, str]:
+        """推送一批事件；返回 (是否成功, 说明)。"""
+        if not self.enabled:
+            return False, self.blocker or "推送未启用"
+        body = json.dumps({
+            "session": self.session,
+            "text": self.render(events),
+            "summary": "relay：%d 个新事件" % len(events),
+        }, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(self.url, data=body, method="POST")
+        req.add_header("content-type", "application/json; charset=utf-8")
+        if self.token:
+            req.add_header("x-relay-token", self.token)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                payload = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                pass
+            return False, "HTTP %s %s" % (exc.code, detail.strip())
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            return False, "连接失败 %r" % (exc,)
+        try:
+            data = json.loads(payload) if payload.strip() else {}
+        except ValueError:
+            return False, "响应不是合法 JSON: %s" % payload.strip()[:200]
+        if not data.get("ok"):
+            return False, "插件拒绝: %s" % payload.strip()[:200]
+        return True, str(data.get("status") or "")
+
+
 # ----------------------------- 主循环 -----------------------------
 
 def render(cfg: Dict[str, Any], shots: ShotSource, wechat: WechatSource, state: State,
            interval: float, idle: float, max_wait: float, sources: List[str],
-           guard: "OwnerGuard") -> None:
+           guard: "OwnerGuard", waker: Optional[Waker] = None) -> None:
     if not (cfg.get("output") or {}).get("banner", True):
         return
     print("=== wait_events v%s ===" % VERSION)
@@ -764,8 +867,16 @@ def render(cfg: Dict[str, Any], shots: ShotSource, wechat: WechatSource, state: 
         print("微信源: %s  (%s)" % (wechat.inbox, status))
         if wechat.warning:
             print("        ⚠ %s" % wechat.warning)
-    print("轮询 %.1fs  空闲退出 %.1fs（打印过第一个事件后才开始计时；零事件时一直等下去）  最长等待 %s  状态文件 %s"
-          % (interval, idle, ("%.0fs" % max_wait) if max_wait > 0 else "不限", state.path))
+    if waker is not None and waker.enabled:
+        print("模式: 常驻推送（不空闲退出）")
+        hold = "攒够 %.0fs 也推一次" % waker.max_hold if waker.max_hold > 0 else "持续有新事件就一直不推"
+        print("推送: %s → 会话 %s" % (waker.url, waker.session))
+        print("      静默去抖 %.1fs（最后一个事件之后安静这么久才推；%s）" % (waker.debounce, hold))
+    elif waker is not None and waker.requested:
+        print("模式: 阻塞（推送未启用：%s）" % (waker.blocker or "未知原因"))
+    print("轮询 %.1fs  空闲退出 %s  最长等待 %s  状态文件 %s"
+          % (interval, ("%.1fs" % idle) if idle > 0 else "关闭（零事件时一直等下去）",
+             ("%.0fs" % max_wait) if max_wait > 0 else "不限", state.path))
     print("独占: %s pid %d（新会话启动会自动接管，被接管的旧脚本静默退出）"
           % (guard.session or "非 DSH 环境", guard.pid))
     print("等待新事件…（Agent 请保持阻塞，不要设超时）", flush=True)
@@ -788,15 +899,23 @@ def run(args: argparse.Namespace) -> int:
         cfg.setdefault("output", {})["wechat_show_meta"] = args.wechat_meta
     if args.exclusive is not None:
         cfg["exclusive_owner"] = args.exclusive
+    push_cfg = dict(cfg.get("push") or {})
+    for key, value in (("enabled", args.push), ("url", args.push_url), ("token", args.push_token),
+                       ("session", args.push_session), ("debounce_sec", args.debounce),
+                       ("max_hold_sec", args.push_max_hold)):
+        if value is not None:
+            push_cfg[key] = value
+    cfg["push"] = push_cfg
     sources = [s for s in (args.sources.split(",") if args.sources else cfg.get("sources") or []) if s]
     if not sources:
         print("[错误] 没有可用的监听源（sources 为空）", file=sys.stderr)
         return 2
 
+    session_id = args.owner_session or os.environ.get("DSH_SESSION_ID") or ""
     state = State(abspath(str(cfg.get("state_file") or ".state/wait_events_state.json")))
     state.data["_max_seen"] = int(cfg.get("max_seen", 4000))
 
-    guard = OwnerGuard(cfg, session_id=(args.owner_session or os.environ.get("DSH_SESSION_ID") or ""),
+    guard = OwnerGuard(cfg, session_id=session_id,
                        enabled=bool(cfg.get("exclusive_owner", True)))
     claim_rc = guard.claim(force=bool(getattr(args, "force_owner", False)))
     if claim_rc:
@@ -819,6 +938,14 @@ def run(args: argparse.Namespace) -> int:
         if kept and not args.quiet:
             print("[基线] 目录里有 %d 个最近落盘的图，算新事件上报" % kept, file=sys.stderr)
 
+    fmt = (cfg.get("output") or {}).get("format", "lines")
+    wmeta = bool((cfg.get("output") or {}).get("wechat_show_meta", False))
+    emit = (lambda ev: print(ev.to_json() if fmt == "json" else ev.to_line(wmeta), flush=True))
+    waker = Waker(push_cfg, session_id, wmeta)
+    push_mode = waker.enabled
+    if push_mode and args.once:
+        waker.debounce = 0.0                       # --once 是自测：扫完就推，不等去抖
+
     if args.status:
         print("=== wait_events 状态 ===")
         print("状态文件: %s（%s）" % (state.path, "首次运行前" if state.fresh else "已存在"))
@@ -829,11 +956,17 @@ def run(args: argparse.Namespace) -> int:
         if wechat:
             print("微信收件箱: %s（游标 acked=%s read=%s）"
                   % (wechat.inbox, state.data.get("wechat_acked_offset"), state.data.get("wechat_read_offset")))
+        print("推送: %s  会话 %s  静默 %.1fs  已推 %s 批  最近一次 %s"
+              % (("启用 " + waker.url) if waker.enabled else ("未启用（%s）" % (waker.blocker or "配置里 enabled=false")),
+                 waker.session or "-", waker.debounce, state.data.get("pushes", 0),
+                 json.dumps(state.data.get("last_push") or {}, ensure_ascii=False)))
         print("最近一次运行: %s" % json.dumps(state.data.get("last_run") or {}, ensure_ascii=False))
         return 0
 
     interval = max(0.2, float(cfg["poll_interval_sec"]))
     idle = float(cfg["idle_timeout_sec"])
+    if push_mode:
+        idle = 0.0                                 # 常驻：永不因空闲退出（推送才是「结束」）
     max_wait = float(cfg["max_wait_sec"])
     started_at = time.monotonic()
     last_event = started_at
@@ -854,7 +987,14 @@ def run(args: argparse.Namespace) -> int:
             pass
 
     if not args.once:
-        render(cfg, shots, wechat, state, interval, idle, max_wait, sources, guard)
+        render(cfg, shots, wechat, state, interval, idle, max_wait, sources, guard, waker)
+
+    # ---- 推送批次（推送成功才清空；push_mode 之外一直是空的） ----
+    pending: List[Event] = []
+    pending_since: Optional[float] = None
+    next_retry_at = 0.0
+    last_push_error_at = 0.0
+    pushes = 0
 
     # ---- 启动时重放：上一轮打印了但没干净退出的事件 ----
     # 截图源在这里补打；微信源不在这里轮询（否则会把「新消息」误当已消费吞掉），
@@ -865,13 +1005,13 @@ def run(args: argparse.Namespace) -> int:
             event = Event("IMG", path=path or name, name=name, replay=True)
             print(event.to_line(), flush=True)
             printed_this_run.append(event)
+            if push_mode:
+                pending.append(event)
     if printed_this_run:
         last_event = time.monotonic()
         armed = True                           # 重放也是「打印过」，同样启动空闲计时
-
-    fmt = (cfg.get("output") or {}).get("format", "lines")
-    wmeta = bool((cfg.get("output") or {}).get("wechat_show_meta", False))
-    emit = (lambda ev: print(ev.to_json() if fmt == "json" else ev.to_line(wmeta), flush=True))
+    if pending:
+        pending_since = last_event
 
     # ---- 主循环 ----
     while True:
@@ -882,6 +1022,7 @@ def run(args: argparse.Namespace) -> int:
             print("--- %s：静默退出（本轮不打印事件、不改账本）---" % guard.reason, flush=True)
             return 4
         new_count = 0
+        before = len(printed_this_run)                 # 这一轮新打印的事件从 before 开始
         if shots:
             for _directory, name, mtime in shots.scan():
                 event = Event("IMG", path=os.path.join(_directory, name), name=name)
@@ -903,9 +1044,48 @@ def run(args: argparse.Namespace) -> int:
             last_event = time.monotonic()
             armed = True                       # 有输出 → 从此开始算空闲
             state.save()                       # 打印即落盘：被 kill 也不会重复打印
-            if args.once:
-                break
-        elif args.once:
+            if push_mode:                      # 攒进批次：等「静默 N 秒」再推
+                if not pending:
+                    pending_since = last_event
+                pending.extend(printed_this_run[before:])
+
+        # ---- 推送：静默去抖（最后一个事件之后安静 debounce 秒才推）----
+        # 持续有新事件 → last_event 一直被刷新 → 永远不满足 quiet，于是「一直不推」。
+        if push_mode and pending:
+            now = time.monotonic()
+            quiet = (now - last_event) >= waker.debounce
+            held = (now - pending_since) if pending_since is not None else 0.0
+            due = quiet and (waker.max_hold <= 0 or held >= waker.max_hold)
+            if due and now >= next_retry_at:
+                batch = list(pending)
+                ok, info = waker.push(batch)
+                if ok:
+                    pending = []
+                    pending_since = None
+                    next_retry_at = 0.0
+                    pushes += 1
+                    state.clear_unacked()                      # 送达才确认
+                    if wechat:
+                        state.data["wechat_acked_offset"] = wechat.printed_offset
+                    state.data["pushes"] = int(state.data.get("pushes", 0)) + 1
+                    state.data["last_push"] = {
+                        "ts": round(time.time(), 3),
+                        "count": len(batch),
+                        "img": sum(1 for e in batch if e.kind == "IMG"),
+                        "wx": sum(1 for e in batch if e.kind == "WX"),
+                        "status": info,
+                    }
+                    state.save()
+                    print("--- 已推送 %d 条事件 → 会话 %s（agent status=%s）---"
+                          % (len(batch), waker.session, info or "?"), flush=True)
+                else:
+                    if now - last_push_error_at >= waker.retry_log_sec:   # 失败限频播报
+                        last_push_error_at = now
+                        print("--- 推送失败（%s）：%d 条事件保留在批次里，稍后重试 ---"
+                              % (info, len(pending)), file=sys.stderr, flush=True)
+                    next_retry_at = now + (60.0 if "429" in info else 5.0)
+
+        if args.once:                          # 自测：扫完（并推完）就退
             break
 
         if max_wait > 0 and (time.monotonic() - started_at) >= max_wait:
@@ -921,10 +1101,16 @@ def run(args: argparse.Namespace) -> int:
             slept += step
 
     # ---- 干净退出：确认本轮所有输出 ----
+    # 推送模式例外：只有「推送成功」的批次才算确认过，这里绝不能顺手把没推出去的事件清掉
+    # （否则 --max-wait / --once / Ctrl+C 一退，事件就凭空消失了）。
     guard.release()
-    state.clear_unacked()
-    if wechat:
-        state.data["wechat_acked_offset"] = wechat.read_offset
+    if not (push_mode and pending):
+        state.clear_unacked()
+        if wechat:
+            state.data["wechat_acked_offset"] = wechat.read_offset
+    elif not args.quiet:
+        print("--- 还有 %d 条事件没推出去：保留在账本里，下次运行会自动补推 ---" % len(pending),
+              file=sys.stderr, flush=True)
     state.data["runs"] = int(state.data.get("runs", 0)) + 1
     state.data["last_run"] = {
         "ts": round(time.time(), 3),
@@ -933,10 +1119,15 @@ def run(args: argparse.Namespace) -> int:
         "wx": sum(1 for e in printed_this_run if e.kind == "WX"),
         "replay": sum(1 for e in printed_this_run if e.replay),
         "idle_timeout": idle,
+        "pushes": pushes,
+        "pending": len(pending),
     }
     state.save()
     if not args.quiet:
-        if printed_this_run:
+        if push_mode:
+            print("--- 常驻推送结束：本轮推送 %d 批，%d 条未推送（留在账本里，下次运行会补推）---"
+                  % (pushes, len(pending)), flush=True)
+        elif printed_this_run:
             print("--- 空闲 %.1fs 无新事件，安全退出；本轮输出 %d 条（IMG %d / WX %d，重放 %d）---"
                   % (idle, len(printed_this_run),
                      sum(1 for e in printed_this_run if e.kind == "IMG"),
@@ -975,6 +1166,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="关闭独占登记（允许多个等待脚本并存，一般不用）")
     ap.add_argument("--force-owner", dest="force_owner", action="store_true",
                     help="强制接管事件流（忽略交棒保留期；确认要在本会话监听时才用）")
+    ap.add_argument("--push", dest="push", action="store_true", default=None,
+                    help="常驻推送模式：新事件静默 N 秒后主动推给 DSH 的 relay-wake 插件，唤醒空闲会话")
+    ap.add_argument("--no-push", dest="push", action="store_false",
+                    help="关闭推送模式（回到「打印 + 空闲退出」的阻塞模式）")
+    ap.add_argument("--push-url", default=None, help="推送地址（默认取配置 push.url）")
+    ap.add_argument("--push-token", default=None, help="鉴权头 x-relay-token（默认取配置 push.token）")
+    ap.add_argument("--push-session", default=None,
+                    help="唤醒目标会话 id（默认取 --owner-session / DSH_SESSION_ID）")
+    ap.add_argument("--debounce", type=float, default=None,
+                    help="静默去抖秒数：最后一个事件之后安静这么久才推送（默认取配置 8.0）")
+    ap.add_argument("--push-max-hold", type=float, default=None,
+                    help="兜底：持续有新事件时，攒够这么久也推一次（0=一直不推，默认）")
     return ap
 
 

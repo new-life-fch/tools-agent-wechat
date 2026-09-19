@@ -112,9 +112,19 @@ $P wechat_gateway.py serve
 $P start_capture.py --print-cmd     # 先确认端口/目录，不启动
 $P start_capture.py
 
-# ④ 主循环（Agent 侧）：阻塞等待 → 读图解题 → 发微信 → 再回到 ④
-$P wait_events.py
+# ④ 主循环（Agent 侧）：常驻推送 → 有新事件时主动唤醒 Agent → 读图解题 → 发微信
+$P wait_events.py --push
+#   备用（没有 DSH / 没装 relay-wake 插件时）：$P wait_events.py   ← 打印事件 + 空闲退出
 ```
+
+**`--push` 是什么**：脚本常驻不退出；收到截图/微信后**静默 N 秒**（默认 8s，
+`--debounce` 可调）没有新事件，就把这一批 POST 给 DSH 的 `relay-wake` 插件
+（`http://127.0.0.1:3080/relay/wake`，见 `dsh-plugin-relay-wake/`），由插件调
+`Agent.followup()` **直接开一个新 turn 把 Agent 叫醒**。持续有新事件就一直不推（攒成一批）；
+没有新事件就什么都不做。推送成功才推进账本，失败保留重试（最多重复投递，绝不丢）。
+
+为什么不再靠「脚本退出 → job 结算通知」：那条通知受 `tool-jobs.maxConsecutiveWakes`
+预算限制（默认连续 3 次），用完就只进收件箱不唤醒——实测出现过 **47 分 54 秒空窗**。
 
 **顺序无所谓**（三个进程互不依赖），但要「先全起来，再让用户按热键」。
 各步的存活验证：
@@ -124,7 +134,7 @@ $P wait_events.py
 | ① | `$P wechat_gateway.py doctor` → 凭据 ✓ / iLink 可达 ✓ |
 | ② | `curl -s http://127.0.0.1:8799/health` → `"ok": true`，收到消息时 `inbox.count` 增长 |
 | ③ | 日志出现「接收保存目录 …」「[热键] Ctrl+` 已启用」；`lsof -nP -iTCP:5077 -sTCP:LISTEN` 有输出 |
-| ④ | 打印横幅后安静等待即是正常（**零事件不退出**，静默 ≠ 卡死）|
+| ④ | `--push` 横幅出现「模式: 常驻推送」+「推送: …/relay/wake → 会话 session-…」；`curl -s http://127.0.0.1:3080/relay/health` → `"ok":true`（备用模式：打印横幅后安静等待即是正常，**零事件不退出**，静默 ≠ 卡死）|
 
 ### 谁读哪份配置 / 谁拉起谁
 

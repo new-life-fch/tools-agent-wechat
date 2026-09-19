@@ -44,9 +44,6 @@
                                 // 另：脚本会盯着 DSH 的「归档」状态（$DSH_HOME/storages/workspace.json）——
                                 // 你在 GUI 里终结某对话后，它的等待脚本会在 ≤1 个轮询周期内自动退场
                                 // （不打印任何事件、不改账本），不会再唤醒那个对话，也不会抢走你的截图
-  "": "",     // 交棒保留期：空闲退出后这 10 分钟内，事件流仍归本会话，
-                                // 防旧会话趁着「新会话脚本正在解题、暂时没在等」的空窗把事件抢回去
-                                // （确需强行切换：--force-owner）
   "replay_unacked": true,       // 上一轮被 kill 掉、没走完确认流程的输出，下次运行以 REPLAY 重放
   "max_seen": 4000,             // 账本最多记多少条文件名（超出淘汰最老的）
 
@@ -57,6 +54,22 @@
     "require_gateway_fresh_sec": 0,  // >0：网关心跳超过该秒数就暂停微信源（默认 0=只要收件箱有文件就读）
     "cold_start_lookback_sec": 300,  // 首次运行：最近 5 分钟的微信消息仍然算新（免得漏掉你刚发的问题）
     "max_batch": 20                  // 单轮最多上报多少条微信消息（防刷屏）
+  },
+
+  // ---- 推送模式（--push：常驻；新事件「静默 N 秒」后主动唤醒 Agent）----
+  // 语义：收到截图/微信后开始计时，**N 秒内没有新事件才推送**；期间持续有新事件就一直不推
+  //       （攒成一批一起推）。没有新事件就什么都不做。推送成功才推进账本，失败保留待重试。
+  // 依赖 host 插件 relay-wake（见 dsh-plugin-relay-wake/），token 必须与插件行里的 config.token 一致。
+  "push": {
+    "enabled": false,                              // true 或命令行加 --push 才启用
+    "url": "http://127.0.0.1:3080/relay/wake",     // DSH web 端口 + 插件路由
+    "token": "15761ffe3cd6090069e43192017a68b8",   // 与 ~/.dsh/profiles/web/cordis.patch.yml 里的一致
+    "session": "",                                 // 留空 = DSH_SESSION_ID（脚本自己所在的会话）
+    "debounce_sec": 8.0,                           // 静默去抖：最后一个事件之后安静这么久才推
+    "max_hold_sec": 0,                             // >0=持续有新事件时攒够这么久也推一次；0=一直不推
+    "max_text_chars": 8000,                        // 单条推送正文上限（超出截断并标注）
+    "request_timeout_sec": 10.0,
+    "retry_log_sec": 30.0                          // 推送失败时的日志限频
   },
 
   // ---- 输出 ----
